@@ -1,6 +1,9 @@
 #include "d3d12_hooks.hpp"
 
 #include "hud_guard.hpp"
+#include "runtime.hpp"
+#include "srv_clamp_logic.hpp"
+#include "perf.hpp"
 
 #include <safetyhook.hpp>
 #include <swofty/mixin.hpp>
@@ -8,7 +11,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 namespace d3d12hooks {
@@ -35,6 +40,9 @@ Subs<ResizeFn> resizes;
 Subs<ExecFn> execs;
 Subs<BarrierFn> barriers;
 Subs<SetNameFn> setnames;
+Subs<ResetFn> resets;
+Subs<RenderTargetsFn> render_targets;
+Subs<RtvFn> rtvs;
 
 template <class T> void release(T *&p)
 {
@@ -50,7 +58,7 @@ std::vector<std::pair<void *, UINT>> pending_color_space;
 safetyhook::InlineHook h_present, h_resize, h_resize1, h_color_space, h_create, h_create_hwnd, h_create_core,
     h_create_comp, h_exec, h_barrier, h_setname;
 HMODULE impl_create, impl_hwnd, impl_core, impl_comp;
-constexpr size_t SETNAME_SLOT = 6, EXEC_SLOT = 10, BARRIER_SLOT = 26;
+constexpr size_t RESOURCE_GETDESC_SLOT = 10, SRV_SLOT = 19, SETNAME_SLOT = 6, EXEC_SLOT = 10, BARRIER_SLOT = 26, RTV_SLOT = 20, OM_SLOT = 46;
 thread_local int creating;
 std::atomic<bool> in_present;
 
@@ -283,10 +291,13 @@ HRESULT STDMETHODCALLTYPE color_space_hook(IDXGISwapChain3 *sc, DXGI_COLOR_SPACE
 
 void STDMETHODCALLTYPE exec_hook(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists)
 {
+    ExecPlan plan;
     for (int i = 0, k = execs.n.load(); i < k; i++)
-        if (execs.fns[i](q, n, lists))
-            return;
-    h_exec.call<void>(q, n, lists);
+        execs.fns[i](q, n, lists, plan);
+    run_plan(plan, q, n, lists, [](ID3D12CommandQueue *queue, UINT count, ID3D12CommandList *const *first) {
+        perf::Pause game;
+        h_exec.call<void>(queue, count, first);
+    });
 }
 
 void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList *list, UINT n, const D3D12_RESOURCE_BARRIER *b)
@@ -297,11 +308,372 @@ void STDMETHODCALLTYPE barrier_hook(ID3D12GraphicsCommandList *list, UINT n, con
     h_barrier.call<void>(list, n, b);
 }
 
+enum : uint8_t { ARG_TABLE = 1, ARG_CONSTANTS, ARG_CBV, ARG_SRV, ARG_UAV };
+enum : size_t {
+    RESET_SLOT = 10,
+    CLEAR_STATE_SLOT = 11,
+    PSO_SLOT = 25,
+    HEAPS_SLOT = 28,
+    COMPUTE_ROOT_SLOT = 29,
+    GRAPHICS_ROOT_SLOT = 30,
+    COMPUTE_TABLE_SLOT = 31,
+    GRAPHICS_TABLE_SLOT = 32,
+    COMPUTE_CONSTANT_SLOT = 33,
+    COMPUTE_CONSTANTS_SLOT = 35,
+    COMPUTE_CBV_SLOT = 37,
+    COMPUTE_SRV_SLOT = 39,
+    COMPUTE_UAV_SLOT = 41,
+    PSO1_SLOT = 75,
+};
+
+safetyhook::InlineHook h_reset, h_clear_state, h_pso, h_heaps, h_compute_root, h_compute_table, h_compute_constant,
+    h_compute_constants, h_compute_cbv, h_compute_srv, h_compute_uav, h_pso1, h_graphics_root, h_graphics_table;
+std::mutex states_lock;
+std::vector<std::pair<ID3D12GraphicsCommandList *, ListState *>> states;
+thread_local ID3D12GraphicsCommandList *state_list;
+thread_local ListState *state_of;
+
+// A list's state, made on first sight. A list first seen anywhere but Reset is not known until its
+// next Reset, as what it bound before the hooks saw it is lost.
+ListState *tracked(ID3D12GraphicsCommandList *l)
+{
+    if (l == state_list)
+        return state_of;
+    std::lock_guard<std::mutex> g(states_lock);
+    auto it = std::lower_bound(states.begin(), states.end(), l,
+                               [](const std::pair<ID3D12GraphicsCommandList *, ListState *> &e,
+                                  ID3D12GraphicsCommandList *k) { return e.first < k; });
+    if (it == states.end() || it->first != l)
+        it = states.insert(it, {l, new ListState()});
+    state_list = l;
+    state_of = it->second;
+    return state_of;
+}
+
+void forget(ListState *s, ID3D12PipelineState *pso)
+{
+    s->known = true;
+    s->pso = pso;
+    s->state_object = nullptr;
+    s->heaps = 0;
+    s->compute_root = nullptr;
+    s->args = 0;
+    s->graphics_root = nullptr;
+    s->tables = 0;
+}
+
+RootArg *arg_at(ListState *s, UINT index)
+{
+    if (index >= 64)
+        return nullptr;
+    if (index >= s->args) {
+        for (UINT i = s->args; i <= index; i++)
+            s->arg[i].kind = 0;
+        s->args = index + 1;
+    }
+    return &s->arg[index];
+}
+
+HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList *l, ID3D12CommandAllocator *a, ID3D12PipelineState *p)
+{
+    HRESULT hr = h_reset.call<HRESULT>(l, a, p);
+    if (SUCCEEDED(hr)) {
+        forget(tracked(l), p);
+        for (int i = 0, k = resets.n.load(); i < k; i++)
+            resets.fns[i](l);
+    }
+    return hr;
+}
+
+void STDMETHODCALLTYPE clear_state_hook(ID3D12GraphicsCommandList *l, ID3D12PipelineState *p)
+{
+    h_clear_state.call<void>(l, p);
+    ListState *s = tracked(l);
+    bool known = s->known;
+    forget(s, p);
+    s->known = known;
+}
+
+void STDMETHODCALLTYPE pso_hook(ID3D12GraphicsCommandList *l, ID3D12PipelineState *p)
+{
+    h_pso.call<void>(l, p);
+    ListState *s = tracked(l);
+    s->pso = p;
+    s->state_object = nullptr;
+}
+
+void STDMETHODCALLTYPE pso1_hook(ID3D12GraphicsCommandList *l, ID3D12StateObject *o)
+{
+    h_pso1.call<void>(l, o);
+    ListState *s = tracked(l);
+    s->state_object = o;
+    s->pso = nullptr;
+}
+
+void STDMETHODCALLTYPE heaps_hook(ID3D12GraphicsCommandList *l, UINT n, ID3D12DescriptorHeap *const *h)
+{
+    h_heaps.call<void>(l, n, h);
+    ListState *s = tracked(l);
+    s->heaps = std::min<UINT>(n, 2);
+    for (UINT i = 0; i < s->heaps; i++)
+        s->heap[i] = h[i];
+}
+
+void STDMETHODCALLTYPE compute_root_hook(ID3D12GraphicsCommandList *l, ID3D12RootSignature *r)
+{
+    h_compute_root.call<void>(l, r);
+    ListState *s = tracked(l);
+    if (s->compute_root != r)
+        s->args = 0;
+    s->compute_root = r;
+}
+
+void STDMETHODCALLTYPE graphics_root_hook(ID3D12GraphicsCommandList *l, ID3D12RootSignature *r)
+{
+    h_graphics_root.call<void>(l, r);
+    ListState *s = tracked(l);
+    if (s->graphics_root != r)
+        s->tables = 0;
+    s->graphics_root = r;
+}
+
+void STDMETHODCALLTYPE graphics_table_hook(ID3D12GraphicsCommandList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h)
+{
+    h_graphics_table.call<void>(l, i, h);
+    if (i >= 64)
+        return;
+    ListState *s = tracked(l);
+    for (UINT k = s->tables; k < i; k++)
+        s->table[k] = 0;
+    s->table[i] = h.ptr;
+    s->tables = std::max(s->tables, i + 1);
+}
+
+void STDMETHODCALLTYPE compute_table_hook(ID3D12GraphicsCommandList *l, UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h)
+{
+    h_compute_table.call<void>(l, i, h);
+    if (RootArg *a = arg_at(tracked(l), i)) {
+        a->kind = ARG_TABLE;
+        a->value = h.ptr;
+    }
+}
+
+void STDMETHODCALLTYPE compute_constant_hook(ID3D12GraphicsCommandList *l, UINT i, UINT v, UINT at)
+{
+    h_compute_constant.call<void>(l, i, v, at);
+    RootArg *a = arg_at(tracked(l), i);
+    if (a && at < 64) {
+        if (a->kind != ARG_CONSTANTS)
+            a->count = 0;
+        a->kind = ARG_CONSTANTS;
+        a->c[at] = v;
+        a->count = std::max(a->count, at + 1);
+    }
+}
+
+void STDMETHODCALLTYPE compute_constants_hook(ID3D12GraphicsCommandList *l, UINT i, UINT n, const void *v, UINT at)
+{
+    h_compute_constants.call<void>(l, i, n, v, at);
+    RootArg *a = arg_at(tracked(l), i);
+    if (a && v && at + n <= 64) {
+        if (a->kind != ARG_CONSTANTS)
+            a->count = 0;
+        a->kind = ARG_CONSTANTS;
+        memcpy(&a->c[at], v, size_t(n) * 4);
+        a->count = std::max(a->count, at + n);
+    }
+}
+
+template <uint8_t KIND, safetyhook::InlineHook *H>
+void STDMETHODCALLTYPE compute_view_hook(ID3D12GraphicsCommandList *l, UINT i, D3D12_GPU_VIRTUAL_ADDRESS va)
+{
+    H->call<void>(l, i, va);
+    if (RootArg *a = arg_at(tracked(l), i)) {
+        a->kind = KIND;
+        a->value = va;
+    }
+}
+
+safetyhook::InlineHook h_rtv, h_om;
+
+void STDMETHODCALLTYPE rtv_hook(ID3D12Device *d, ID3D12Resource *r, const D3D12_RENDER_TARGET_VIEW_DESC *desc,
+                                D3D12_CPU_DESCRIPTOR_HANDLE at)
+{
+    h_rtv.call<void>(d, r, desc, at);
+    for (int i = 0, k = rtvs.n.load(); i < k; i++)
+        rtvs.fns[i](r, at);
+}
+
+void STDMETHODCALLTYPE om_hook(ID3D12GraphicsCommandList *l, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE *rtv,
+                               BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE *dsv)
+{
+    for (int i = 0, k = render_targets.n.load(); i < k; i++)
+        render_targets.fns[i](l, n, rtv, single);
+    h_om.call<void>(l, n, rtv, single, dsv);
+}
+
 HRESULT STDMETHODCALLTYPE setname_hook(ID3D12Object *o, LPCWSTR name)
 {
     for (int i = 0, k = setnames.n.load(); i < k; i++)
         setnames.fns[i](o, name);
     return h_setname.call<HRESULT>(o, name);
+}
+
+using SrvFn = void(STDMETHODCALLTYPE *)(ID3D12Device *, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T);
+SrvFn srv_orig;
+std::mutex srv_lock;
+std::unordered_set<uint64_t> srv_seen;
+
+const GUID kNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
+
+std::string srv_name(ID3D12Resource *r)
+{
+    wchar_t w[128] = {};
+    UINT size = sizeof w - sizeof(wchar_t);
+    char out[160] = {};
+    if (SUCCEEDED(r->GetPrivateData(kNameW, &size, w)) && size >= sizeof(wchar_t)) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, int(size / sizeof(wchar_t)), out, int(sizeof out) - 1, nullptr,
+                                    nullptr);
+        if (n > 0)
+            return std::string(out, strnlen(out, size_t(n)));
+    }
+    char b[48];
+    snprintf(b, sizeof b, "%p", static_cast<void *>(r));
+    return b;
+}
+
+void srv_report(ID3D12Resource *r, const runtime::srv_clamp::View &v, const runtime::srv_clamp::Resource &res,
+                const runtime::srv_clamp::Plan &p)
+{
+    using runtime::srv_clamp::Action;
+    uint64_t key = (reinterpret_cast<uint64_t>(r) * 0x9e3779b97f4a7c15ull) ^ (uint64_t(v.slices) << 40) ^
+                   (uint64_t(v.first_slice) << 20) ^ (uint64_t(v.mip_levels) << 8) ^ v.most_detailed_mip;
+    {
+        std::lock_guard<std::mutex> g(srv_lock);
+        if (srv_seen.size() >= 4096 || !srv_seen.insert(key).second)
+            return;
+    }
+    std::string name = srv_name(r);
+    if (p.action == Action::Skip)
+        swofty::log("[gfx] srv: array view from slice %u on a %u-slice texture %s; skipped", v.first_slice, res.slices,
+                    name.c_str());
+    else if (p.slices_changed)
+        swofty::log("[gfx] srv: array view of %u slices on a %u-slice texture %s; clamped", v.slices, res.slices,
+                    name.c_str());
+    else
+        swofty::log("[gfx] srv: view of mips %u+%u on a %u-mip texture %s; clamped", v.most_detailed_mip, v.mip_levels,
+                    res.mips, name.c_str());
+}
+
+void STDMETHODCALLTYPE srv_hook(ID3D12Device *dev, ID3D12Resource *r, const D3D12_SHADER_RESOURCE_VIEW_DESC *d,
+                                SIZE_T h)
+{
+    using namespace runtime::srv_clamp;
+    if (!r || !d) {
+        srv_orig(dev, r, d, h);
+        return;
+    }
+    using GetDescFn = D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(ID3D12Resource *, D3D12_RESOURCE_DESC *);
+    D3D12_RESOURCE_DESC rd{};
+    reinterpret_cast<GetDescFn>((*reinterpret_cast<void ***>(r))[RESOURCE_GETDESC_SLOT])(r, &rd);
+    View v;
+    v.dimension = int(d->ViewDimension);
+    switch (d->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+        v.most_detailed_mip = d->Texture1D.MostDetailedMip;
+        v.mip_levels = d->Texture1D.MipLevels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+        v.most_detailed_mip = d->Texture1DArray.MostDetailedMip;
+        v.mip_levels = d->Texture1DArray.MipLevels;
+        v.first_slice = d->Texture1DArray.FirstArraySlice;
+        v.slices = d->Texture1DArray.ArraySize;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+        v.most_detailed_mip = d->Texture2D.MostDetailedMip;
+        v.mip_levels = d->Texture2D.MipLevels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        v.most_detailed_mip = d->Texture2DArray.MostDetailedMip;
+        v.mip_levels = d->Texture2DArray.MipLevels;
+        v.first_slice = d->Texture2DArray.FirstArraySlice;
+        v.slices = d->Texture2DArray.ArraySize;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        v.first_slice = d->Texture2DMSArray.FirstArraySlice;
+        v.slices = d->Texture2DMSArray.ArraySize;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+        v.most_detailed_mip = d->Texture3D.MostDetailedMip;
+        v.mip_levels = d->Texture3D.MipLevels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+        v.most_detailed_mip = d->TextureCube.MostDetailedMip;
+        v.mip_levels = d->TextureCube.MipLevels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+        v.most_detailed_mip = d->TextureCubeArray.MostDetailedMip;
+        v.mip_levels = d->TextureCubeArray.MipLevels;
+        v.first_slice = d->TextureCubeArray.First2DArrayFace;
+        v.slices = cube_slices(d->TextureCubeArray.NumCubes);
+        break;
+    default:
+        srv_orig(dev, r, d, h);
+        return;
+    }
+    Resource res;
+    res.texture = rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && rd.Dimension != D3D12_RESOURCE_DIMENSION_UNKNOWN;
+    res.volume = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    res.slices = rd.DepthOrArraySize;
+    res.mips = rd.MipLevels;
+    Plan p = plan(v, res);
+    if (p.action == Action::Pass) {
+        srv_orig(dev, r, d, h);
+        return;
+    }
+    srv_report(r, v, res, p);
+    if (p.action == Action::Skip)
+        return;
+    D3D12_SHADER_RESOURCE_VIEW_DESC c = *d;
+    switch (d->ViewDimension) {
+    case D3D12_SRV_DIMENSION_TEXTURE1D:
+        c.Texture1D.MostDetailedMip = p.most_detailed_mip;
+        c.Texture1D.MipLevels = p.mip_levels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+        c.Texture1DArray.MostDetailedMip = p.most_detailed_mip;
+        c.Texture1DArray.MipLevels = p.mip_levels;
+        c.Texture1DArray.ArraySize = p.slices;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2D:
+        c.Texture2D.MostDetailedMip = p.most_detailed_mip;
+        c.Texture2D.MipLevels = p.mip_levels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+        c.Texture2DArray.MostDetailedMip = p.most_detailed_mip;
+        c.Texture2DArray.MipLevels = p.mip_levels;
+        c.Texture2DArray.ArraySize = p.slices;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+        c.Texture2DMSArray.ArraySize = p.slices;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURE3D:
+        c.Texture3D.MostDetailedMip = p.most_detailed_mip;
+        c.Texture3D.MipLevels = p.mip_levels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+        c.TextureCube.MostDetailedMip = p.most_detailed_mip;
+        c.TextureCube.MipLevels = p.mip_levels;
+        break;
+    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+        c.TextureCubeArray.MostDetailedMip = p.most_detailed_mip;
+        c.TextureCubeArray.MipLevels = p.mip_levels;
+        c.TextureCubeArray.NumCubes = p.slices / 6;
+        break;
+    default:
+        break;
+    }
+    srv_orig(dev, r, &c, h);
 }
 
 bool install(safetyhook::InlineHook &h, void *target, void *detour, const char *what)
@@ -413,6 +785,21 @@ void on_setname(SetNameFn fn)
     setnames.add(fn);
 }
 
+void on_render_targets(RenderTargetsFn fn)
+{
+    render_targets.add(fn);
+}
+
+void on_create_rtv(RtvFn fn)
+{
+    rtvs.add(fn);
+}
+
+void on_reset(ResetFn fn)
+{
+    resets.add(fn);
+}
+
 void exec_original(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists)
 {
     if (h_exec && hud::guard::vtable_slot_is(q, EXEC_SLOT, h_exec.target()))
@@ -427,6 +814,75 @@ void barrier_original(ID3D12GraphicsCommandList *list, UINT n, const D3D12_RESOU
         h_barrier.call<void>(list, n, b);
     else
         list->ResourceBarrier(n, b);
+}
+
+bool list_state(ID3D12GraphicsCommandList *list, ListState &out)
+{
+    if (!h_reset)
+        return false;
+    ListState *s = tracked(list);
+    if (!s->known)
+        return false;
+    out.known = true;
+    out.pso = s->pso;
+    out.state_object = s->state_object;
+    out.heaps = s->heaps;
+    out.heap[0] = s->heap[0];
+    out.heap[1] = s->heap[1];
+    out.compute_root = s->compute_root;
+    out.args = s->args;
+    out.graphics_root = s->graphics_root;
+    out.tables = s->tables;
+    memcpy(out.table, s->table, size_t(s->tables) * 8);
+    for (UINT i = 0; i < s->args; i++) {
+        out.arg[i].kind = s->arg[i].kind;
+        out.arg[i].count = s->arg[i].count;
+        out.arg[i].value = s->arg[i].value;
+        if (s->arg[i].kind == ARG_CONSTANTS)
+            memcpy(out.arg[i].c, s->arg[i].c, size_t(s->arg[i].count) * 4);
+    }
+    return true;
+}
+
+// Puts a list's bindings back as list_state read them. The calls go through the hooks, so the list's
+// tracked state ends as it was.
+void restore_list_state(ID3D12GraphicsCommandList *l, const ListState &s)
+{
+    if (s.heaps)
+        l->SetDescriptorHeaps(s.heaps, s.heap);
+    if (s.graphics_root)
+        for (UINT i = 0; i < s.tables; i++)
+            if (s.table[i])
+                l->SetGraphicsRootDescriptorTable(i, {s.table[i]});
+    ID3D12GraphicsCommandList4 *l4 = nullptr;
+    if (s.state_object && SUCCEEDED(l->QueryInterface(IID_PPV_ARGS(&l4)))) {
+        l4->SetPipelineState1(s.state_object);
+        l4->Release();
+    } else if (s.pso)
+        l->SetPipelineState(s.pso);
+    if (!s.compute_root)
+        return;
+    l->SetComputeRootSignature(s.compute_root);
+    for (UINT i = 0; i < s.args; i++) {
+        const RootArg &a = s.arg[i];
+        switch (a.kind) {
+        case ARG_TABLE:
+            l->SetComputeRootDescriptorTable(i, {a.value});
+            break;
+        case ARG_CONSTANTS:
+            l->SetComputeRoot32BitConstants(i, a.count, a.c, 0);
+            break;
+        case ARG_CBV:
+            l->SetComputeRootConstantBufferView(i, a.value);
+            break;
+        case ARG_SRV:
+            l->SetComputeRootShaderResourceView(i, a.value);
+            break;
+        case ARG_UAV:
+            l->SetComputeRootUnorderedAccessView(i, a.value);
+            break;
+        }
+    }
 }
 
 std::string module_of(const void *addr, HMODULE *mod)
@@ -570,12 +1026,18 @@ bool arm_device()
                          reinterpret_cast<void *>(&barrier_hook), "ID3D12GraphicsCommandList::ResourceBarrier") &&
                  install(h_exec, (*reinterpret_cast<void ***>(q))[EXEC_SLOT], reinterpret_cast<void *>(&exec_hook),
                          "ID3D12CommandQueue::ExecuteCommandLists");
+        if (ok && install(h_rtv, (*reinterpret_cast<void ***>(dev))[RTV_SLOT], reinterpret_cast<void *>(&rtv_hook),
+                          "ID3D12Device::CreateRenderTargetView") &&
+            !install(h_om, (*reinterpret_cast<void ***>(list))[OM_SLOT], reinterpret_cast<void *>(&om_hook),
+                     "ID3D12GraphicsCommandList::OMSetRenderTargets"))
+            h_rtv = {};
         if (list)
             list->Close();
     }
     if (ok)
         swofty::log("[d3d12] device hooks armed: SetName (vt+0x30), ResourceBarrier (vt+0xd0), ExecuteCommandLists "
-                    "(vt+0x50)");
+                    "(vt+0x50)%s",
+                    h_om ? ", CreateRenderTargetView (vt+0xa0), OMSetRenderTargets (vt+0x170)" : "");
     release(q);
     release(list);
     release(alloc);
@@ -583,6 +1045,112 @@ bool arm_device()
     release(dev);
     state = ok ? 1 : -1;
     return ok;
+}
+
+bool arm_srv_clamp()
+{
+    static int state;
+    if (state)
+        return state > 0;
+    state = -1;
+    char env[8] = {};
+    GetEnvironmentVariableA("SWOFTY_SRV_CLAMP", env, sizeof env);
+    if (!runtime::srv_clamp::enabled(env)) {
+        swofty::log("[gfx] srv clamp is off (SWOFTY_SRV_CLAMP=1 turns it on)");
+        return false;
+    }
+    ID3D12Device *dev = probe_device();
+    void **vt = dev ? *reinterpret_cast<void ***>(dev) : nullptr;
+    void *srv_target = vt ? vt[SRV_SLOT] : nullptr;
+    HMODULE srv_mod = nullptr;
+    module_of(srv_target, &srv_mod);
+    unsigned long long srv_offset = reinterpret_cast<uintptr_t>(srv_target) - reinterpret_cast<uintptr_t>(srv_mod);
+    DWORD old = 0;
+    bool ok = vt && VirtualProtect(&vt[SRV_SLOT], sizeof(void *), PAGE_READWRITE, &old);
+    if (ok) {
+        srv_orig = reinterpret_cast<SrvFn>(srv_target);
+        vt[SRV_SLOT] = reinterpret_cast<void *>(&srv_hook);
+        VirtualProtect(&vt[SRV_SLOT], sizeof(void *), old, &old);
+        swofty::log("[gfx] srv clamp armed: ID3D12Device::CreateShaderResourceView (vt+0x98, vtable entry for %s+0x%llx) "
+                    "patched; array and mip views past their texture are clamped",
+                    module_of(srv_target).c_str(), srv_offset);
+    } else
+        swofty::log("[gfx] srv clamp: could not patch the ID3D12Device vtable");
+    release(dev);
+    state = ok ? 1 : -1;
+    return ok;
+}
+
+bool arm_list_state()
+{
+    static int state;
+    if (state)
+        return state > 0;
+    state = -1;
+    ID3D12Device *dev = probe_device();
+    ID3D12CommandAllocator *alloc = nullptr;
+    ID3D12GraphicsCommandList *list = nullptr;
+    ID3D12GraphicsCommandList4 *list4 = nullptr;
+    bool ok = false;
+    if (dev && SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) &&
+        SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list))) &&
+        SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list4)))) {
+        void **vt = *reinterpret_cast<void ***>(list), **vt4 = *reinterpret_cast<void ***>(list4);
+        struct Want {
+            size_t slot;
+            safetyhook::InlineHook *h;
+            void *detour;
+        } want[] = {
+            {RESET_SLOT, &h_reset, reinterpret_cast<void *>(&reset_hook)},
+            {CLEAR_STATE_SLOT, &h_clear_state, reinterpret_cast<void *>(&clear_state_hook)},
+            {PSO_SLOT, &h_pso, reinterpret_cast<void *>(&pso_hook)},
+            {HEAPS_SLOT, &h_heaps, reinterpret_cast<void *>(&heaps_hook)},
+            {COMPUTE_ROOT_SLOT, &h_compute_root, reinterpret_cast<void *>(&compute_root_hook)},
+            {COMPUTE_TABLE_SLOT, &h_compute_table, reinterpret_cast<void *>(&compute_table_hook)},
+            {GRAPHICS_ROOT_SLOT, &h_graphics_root, reinterpret_cast<void *>(&graphics_root_hook)},
+            {GRAPHICS_TABLE_SLOT, &h_graphics_table, reinterpret_cast<void *>(&graphics_table_hook)},
+            {COMPUTE_CONSTANT_SLOT, &h_compute_constant, reinterpret_cast<void *>(&compute_constant_hook)},
+            {COMPUTE_CONSTANTS_SLOT, &h_compute_constants, reinterpret_cast<void *>(&compute_constants_hook)},
+            {COMPUTE_CBV_SLOT, &h_compute_cbv, reinterpret_cast<void *>(&compute_view_hook<ARG_CBV, &h_compute_cbv>)},
+            {COMPUTE_SRV_SLOT, &h_compute_srv, reinterpret_cast<void *>(&compute_view_hook<ARG_SRV, &h_compute_srv>)},
+            {COMPUTE_UAV_SLOT, &h_compute_uav, reinterpret_cast<void *>(&compute_view_hook<ARG_UAV, &h_compute_uav>)},
+            {PSO1_SLOT, &h_pso1, reinterpret_cast<void *>(&pso1_hook)},
+        };
+        ok = true;
+        for (auto &a : want)
+            for (auto &b : want)
+                if (&a != &b && (a.slot == PSO1_SLOT ? vt4 : vt)[a.slot] == (b.slot == PSO1_SLOT ? vt4 : vt)[b.slot]) {
+                    swofty::log("[d3d12] command list slots vt+0x%zx and vt+0x%zx share their code; list state is not "
+                                "followed",
+                                a.slot * 8, b.slot * 8);
+                    ok = false;
+                }
+        for (auto &w : want)
+            if (ok)
+                ok = install(*w.h, (w.slot == PSO1_SLOT ? vt4 : vt)[w.slot], w.detour, "ID3D12GraphicsCommandList state");
+        if (!ok)
+            for (auto &w : want)
+                *w.h = {};
+        list->Close();
+    }
+    if (ok)
+        swofty::log("[d3d12] command list state hooks armed: Reset, ClearState, SetPipelineState(1), "
+                    "SetDescriptorHeaps, the compute root bindings and the graphics descriptor tables");
+    release(list4);
+    release(list);
+    release(alloc);
+    release(dev);
+    state = ok ? 1 : -1;
+    return ok;
+}
+
+}
+
+namespace runtime {
+
+void srv_clamp_setup()
+{
+    d3d12hooks::arm_srv_clamp();
 }
 
 }

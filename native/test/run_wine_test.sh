@@ -11,6 +11,7 @@ ITEMS=
 grep -qa '\[items\] ownership check hooked' ../dist/swofty/addons/core/swofty_core.dll && ITEMS=1
 export ZIG_GLOBAL_CACHE_DIR=$PWD/../build/zig-cache ZIG_LOCAL_CACHE_DIR=$PWD/../build/zig-cache
 PIN=(taskset -c 2-7,10,11,14-31 nice -n 10)
+# wine cmd /c reports the game process's own exit code; a bare wine launch can exit 0 when a thread the server kills at termination exits last
 rm -rf "$OUT/game" "$OUT/stages" "$OUT/packed" "$OUT/filled"
 mkdir -p "$OUT/game" "$OUT/stages" "$OUT/packed" "$OUT/filled"
 "${PIN[@]}" zig cc -target x86_64-windows-gnu -O2 -o "$OUT/game/F1_25.exe" fake_game.c -lversion -luser32 -lws2_32 &
@@ -345,12 +346,25 @@ EOF
         once "standings: a round whose track is off is skipped and logged once" '\[career\] standings: round 7 has no track data \(track 200 is off\); skipped'
         once "standings: a round whose weekend can't be read is skipped and logged once" '\[career\] standings: round 10 has no track data; skipped'
         once "weekends: a round whose track has no record is skipped and logged once" '\[career\] weekends: track 1 has no track data; the round shows no track'
+        once "teamhq: the guard is armed" '\[career\] teamhq track guard armed'
+        once "teamhq: an event whose track has no track data is skipped and logged once" '\[career\] teamhq: track 6 has no track data; the event shows no track'
+        once "teamhq: an event whose track has no record is skipped and logged once" '\[career\] teamhq: track 1 has no track data; the event shows no track'
+        once "activity: the guard is armed" '\[career\] activity resume guard armed'
+        once "activity: a championship without race length fields is skipped and logged once" '\[career\] activity resume: the championship has no race length fields'
+        once "pairs: the guard is armed" '\[strategy\] teammate pairs guard armed'
+        once "pairs: a team with a third car is logged once" '\[strategy\] team 6 has 3 cars; only its first two are paired for strategy, the others stay unpaired'
+        once "setups: the guard is armed" '\[setups\] car guard armed at 1 of 4 sites'
         once "fe tiles: the guard is a core mixin set of its own" "core mixin set 'swofty_core\.dll \(front-end tile list guard\)': 3 mixin\(s\)"
         once "fe tiles: the guard is armed" '\[fe\] tiles guard armed'
         once "fe tiles: a list missing from the slot array is skipped and logged once" '\[fe\] tiles: entrant list f2_2026 is not in the game data; its tile is left without a list'
         once "ai corner: the guard is a core mixin set of its own" "core mixin set 'swofty_core\.dll \(ai corner start guard\)': 1 mixin"
         once "ai corner: the guard is armed" '\[ai\] corner start guard armed'
         once "ai corner: a car with no corner start line is skipped and logged once" '\[ai\] corner start: car 3 has no corner start ahead on this track'"'"'s AI line'
+        once "replay grid: the guard is a core mixin set of its own" "core mixin set 'swofty_core\.dll \(replay recorder grid guard\)': 1 mixin"
+        once "replay grid: the guard is armed" '\[replay\] recorder grid guard armed'
+        once "replay grid: the read guard is armed" '\[replay\] read guard armed'
+        once "replay grid: the empty state of a cut recordable is skipped on read and logged once" '\[replay\] a recordable the recorder could not hold has no stored state'
+        once "replay grid: a recordable whose state outgrows its holder is skipped and logged once" '\[replay\] session has \? cars, the recorder holds 22; CannedEventsSystem needs 768 bytes of replay state and its holder has 512, so it is not recorded'
         once "garage crew: the guard is a core mixin set of its own" "core mixin set 'swofty_core\.dll \(garage crew guard\)': 3 mixin"
         once "garage crew: the guard is armed" '\[garage\] crew guard armed'
         count "garage crew: each car dropped from a garage's crew vector is logged once" 4 '\[garage\] garage [5-7]: team 1[2-4] car #4[0-9] \(driver 3[0-9][0-9]\) is the (third|extra) car of its garage'
@@ -605,7 +619,7 @@ for mode in crash exit heap abort; do
     echo "==== $mode"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    timeout -k 5 $([[ $mode == heap || $mode == abort ]] && echo 30 || echo 120) "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" $mode >/dev/null 2>&1 || code=$?
+    timeout -k 5 $([[ $mode == heap || $mode == abort ]] && echo 30 || echo 120) "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" $mode >/dev/null 2>&1 || code=$?
     grep -F '[crash]' "$LOG"
     if [[ $mode == crash ]]; then
         check "crash: first-chance fault with module, section and KB name" '\[crash\] #1 first-chance .*ACCESS_VIOLATION .* at F1_25\.exe\+0x[0-9a-f]+ \.text Fake_Crash_Here\+0x'
@@ -637,7 +651,7 @@ for guard in on off; do
     echo "==== acclim ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_ACCLIM_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" acclim >"$OUT/acclim.out" 2>&1 || code=$?
+    SWOFTY_ACCLIM_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" acclim >"$OUT/acclim.out" 2>&1 || code=$?
     grep -E '\[acclim\]|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "acclim on: the refresh of a programme without targets is skipped" '\[acclim\] Track Acclimatisation programme 0x[0-9a-f]+ has no targets at this track \(targets 0x0\); refresh skipped'
@@ -658,7 +672,7 @@ for guard in on off; do
     echo "==== acclim_penalty ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_ACCLIM_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" acclim_penalty >"$OUT/acclim_penalty.out" 2>&1 || code=$?
+    SWOFTY_ACCLIM_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" acclim_penalty >"$OUT/acclim_penalty.out" 2>&1 || code=$?
     grep -E '\[acclim\]|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "acclim_penalty on: the penalty flag of a programme without targets is skipped" '\[acclim\] Track Acclimatisation programme 0x[0-9a-f]+ has no targets at this track \(targets 0x0\); penalty flag skipped'
@@ -681,7 +695,7 @@ for guard in on off; do
     echo "==== ers_mode ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_ERS_MODE_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" ers_mode >"$OUT/ers_mode.out" 2>&1 || code=$?
+    SWOFTY_ERS_MODE_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" ers_mode >"$OUT/ers_mode.out" 2>&1 || code=$?
     grep -E '\[ers\] (mode|car)|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "ers_mode on: the car's ERS mode is set to Medium before the load" '\[ers\] car 7: ERS mode -2141928108 out of range; set to 1 \(Medium\)'
@@ -701,7 +715,7 @@ for guard in on off; do
     echo "==== standings ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_STANDINGS_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" standings >"$OUT/standings.out" 2>&1 || code=$?
+    SWOFTY_STANDINGS_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" standings >"$OUT/standings.out" 2>&1 || code=$?
     grep -E '\[career\] standings|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "standings on: the round is skipped and logged" '\[career\] standings: round 5 has no track data \(track 200 is off\); skipped'
@@ -721,7 +735,7 @@ for guard in on off; do
     echo "==== weekends ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_STANDINGS_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" weekends >"$OUT/weekends.out" 2>&1 || code=$?
+    SWOFTY_STANDINGS_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" weekends >"$OUT/weekends.out" 2>&1 || code=$?
     grep -E '\[career\] weekends|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         grep -q 'weekends: the round returned 0\b' "$OUT/weekends.out" && echo "ok  : weekends on: the round read as empty" ||
@@ -735,16 +749,93 @@ for guard in on off; do
     fi
 done
 for guard in on off; do
+    echo "==== teamhq ($guard)"
+    code=0
+    rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
+    SWOFTY_TEAMHQ_TRACK_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" teamhq >"$OUT/teamhq.out" 2>&1 || code=$?
+    grep -E '\[career\] teamhq|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
+    if [[ $guard == on ]]; then
+        once "teamhq on: the event is skipped and logged" '\[career\] teamhq: track 6 has no track data; the event shows no track'
+        grep -q 'teamhq: the event returned e3e7\b' "$OUT/teamhq.out" && echo "ok  : teamhq on: the event took the game's empty node path" ||
+            { echo "FAIL: teamhq on: the event did not take the game's empty node path"; status=1; }
+        count "teamhq on: no unhandled fault" 0 '\[crash\] unhandled '
+        compgen -G "$SW/crash-*.txt" >/dev/null && { echo "FAIL: teamhq on: a crash report was written"; status=1; } ||
+            echo "ok  : teamhq on: no crash report"
+    else
+        once "teamhq off: the guard is off" '\[career\] teamhq track guard off \(SWOFTY_TEAMHQ_TRACK_GUARD=0\)'
+        check "teamhq off: the read faults where the game does" '\[crash\] unhandled ACCESS_VIOLATION .*Career_TeamHqAdvance_BuildTrackNode\+0x52'
+        [[ $code != 0 ]] && echo "ok  : teamhq off: process ended with $code" || { echo "FAIL: teamhq off: process exited 0"; status=1; }
+    fi
+done
+for guard in on off; do
+    echo "==== activity ($guard)"
+    code=0
+    rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
+    SWOFTY_ACTIVITY_RESUME_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" activity >"$OUT/activity.out" 2>&1 || code=$?
+    grep -E '\[career\] activity resume|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
+    if [[ $guard == on ]]; then
+        once "activity on: the guard is armed" '\[career\] activity resume guard armed'
+        once "activity on: the read is skipped and logged once" '\[career\] activity resume: the championship has no race length fields'
+        grep -q 'activity: the report returned full\b' "$OUT/activity.out" && echo "ok  : activity on: the report kept the default text" ||
+            { echo "FAIL: activity on: the report did not keep the default text"; status=1; }
+        count "activity on: no unhandled fault" 0 '\[crash\] unhandled '
+        compgen -G "$SW/crash-*.txt" >/dev/null && { echo "FAIL: activity on: a crash report was written"; status=1; } ||
+            echo "ok  : activity on: no crash report"
+    else
+        once "activity off: the guard is off" '\[career\] activity resume guard off \(SWOFTY_ACTIVITY_RESUME_GUARD=0\)'
+        check "activity off: the read faults where the game does" '\[crash\] unhandled ACCESS_VIOLATION .*\.data1 fn base\+0x[0-9a-f]+\+0x65 '
+        [[ $code != 0 ]] && echo "ok  : activity off: process ended with $code" || { echo "FAIL: activity off: process exited 0"; status=1; }
+    fi
+done
+for guard in on off; do
+    echo "==== setup_vm ($guard)"
+    code=0
+    rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
+    SWOFTY_SETUP_VM_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" setup_vm >"$OUT/setup_vm.out" 2>&1 || code=$?
+    grep -E '\[setups\]|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
+    if [[ $guard == on ]]; then
+        once "setup_vm on: the refresh is skipped and logged" '\[setups\] the setup screen has no car yet; skipped'
+        grep -q 'setups: the refresh returned with 0 range updates' "$OUT/setup_vm.out" && echo "ok  : setup_vm on: the refresh took the game's skip path" ||
+            { echo "FAIL: setup_vm on: the refresh did not take the game's skip path"; status=1; }
+        count "setup_vm on: no unhandled fault" 0 '\[crash\] unhandled '
+        compgen -G "$SW/crash-*.txt" >/dev/null && { echo "FAIL: setup_vm on: a crash report was written"; status=1; } ||
+            echo "ok  : setup_vm on: no crash report"
+    else
+        once "setup_vm off: the guard is off" '\[setups\] car guard off \(SWOFTY_SETUP_VM_GUARD=0\)'
+        check "setup_vm off: the read faults where the game does" '\[crash\] unhandled ACCESS_VIOLATION .*Game_CarSetupVm_Initialise\+0x18'
+        [[ $code != 0 ]] && echo "ok  : setup_vm off: process ended with $code" || { echo "FAIL: setup_vm off: process exited 0"; status=1; }
+    fi
+done
+for guard in on off; do
+    echo "==== pairs ($guard)"
+    code=0
+    rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
+    SWOFTY_TEAMMATE_PAIRS_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" pairs >"$OUT/pairs.out" 2>&1 || code=$?
+    grep -E '\[strategy\]|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
+    if [[ $guard == on ]]; then
+        once "pairs on: the team is logged" '\[strategy\] team 6 has 3 cars; only its first two are paired for strategy, the others stay unpaired'
+        grep -q 'pairs: the team was paired' "$OUT/pairs.out" && echo "ok  : pairs on: the team with three cars was paired" ||
+            { echo "FAIL: pairs on: the team with three cars was not paired"; status=1; }
+        count "pairs on: no unhandled fault" 0 '\[crash\] unhandled '
+        compgen -G "$SW/crash-*.txt" >/dev/null && { echo "FAIL: pairs on: a crash report was written"; status=1; } ||
+            echo "ok  : pairs on: no crash report"
+    else
+        once "pairs off: the guard is off" '\[strategy\] teammate pairs guard off \(SWOFTY_TEAMMATE_PAIRS_GUARD=0\)'
+        check "pairs off: the sort faults where the game throws" '\[crash\] unhandled ACCESS_VIOLATION .*Sess_Strategy_SortTeamCars'
+        [[ $code != 0 ]] && echo "ok  : pairs off: process ended with $code" || { echo "FAIL: pairs off: process exited 0"; status=1; }
+    fi
+done
+for guard in on off; do
     echo "==== fe_tiles ($guard)"
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
     if [[ $guard == on ]]; then
         code=0
-        timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" fe_scan >"$OUT/fe_scan.out" 2>&1 || code=$?
+        timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" fe_scan >"$OUT/fe_scan.out" 2>&1 || code=$?
         grep -E '\[fe\] tiles|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
         grep -q 'fe tiles: the scan returned 0\b' "$OUT/fe_scan.out" && echo "ok  : fe tiles on: the scan took the game's no-list path" ||
             { echo "FAIL: fe tiles on: the scan did not take the game's no-list path"; status=1; }
         code=0
-        timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" fe_row >"$OUT/fe_row.out" 2>&1 || code=$?
+        timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" fe_row >"$OUT/fe_row.out" 2>&1 || code=$?
         grep -q 'fe tiles: the list returned 0\b' "$OUT/fe_row.out" && echo "ok  : fe tiles on: the list with no row returned 0" ||
             { echo "FAIL: fe tiles on: the list with no row did not return 0"; status=1; }
         count "fe tiles on: no unhandled fault" 0 '\[crash\] unhandled '
@@ -757,7 +848,7 @@ for guard in on off; do
             fn=$([[ $name == fe_scan ]] && echo FeTile_Get_ListFirstEntrantId || echo FeTile_Check_EntrantListUsable)
             code=0
             rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-            SWOFTY_FE_TILE_GUARD=0 timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" "$name" >"$OUT/$name.out" 2>&1 || code=$?
+            SWOFTY_FE_TILE_GUARD=0 timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" "$name" >"$OUT/$name.out" 2>&1 || code=$?
             grep -E '\[fe\] tiles|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
             once "fe tiles off ($name): the guard is off" '\[fe\] tiles guard off \(SWOFTY_FE_TILE_GUARD=0\)'
             check "fe tiles off ($name): the lookup faults where the game does" "\\[crash\\] unhandled ACCESS_VIOLATION .*$fn\\+$at"
@@ -770,7 +861,7 @@ for guard in on off; do
     echo "==== ai_corner ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_AI_CORNER_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" ai_corner >"$OUT/ai_corner.out" 2>&1 || code=$?
+    SWOFTY_AI_CORNER_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" ai_corner >"$OUT/ai_corner.out" 2>&1 || code=$?
     grep -E '\[ai\] corner start|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "ai corner on: the car is skipped and logged" '\[ai\] corner start: car 3 has no corner start ahead on this track'"'"'s AI line'
@@ -786,9 +877,25 @@ for guard in on off; do
     fi
 done
 for guard in on off; do
+    echo "==== replay_grid ($guard)"
+    code=0
+    SWOFTY_REPLAY_GRID_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" replay_grid >"$OUT/replay_grid.out" 2>&1 || code=$?
+    grep -E '\[replay\] (session has|recorder grid guard)' "$LOG" || true
+    if [[ $guard == on ]]; then
+        once "replay grid on: the oversize state is skipped and logged" '\[replay\] session has \? cars, the recorder holds 22; VehicleSystem needs 12288 bytes of replay state and its holder has 7168, so it is not recorded'
+        grep -q 'replay grid: the recorder would copy 0x0 bytes' "$OUT/replay_grid.out" && echo "ok  : replay grid on: the recorder copies nothing into the holder" ||
+            { echo "FAIL: replay grid on: the recorder would still copy the state"; status=1; }
+    else
+        once "replay grid off: the guard is off" '\[replay\] recorder grid guard off \(SWOFTY_REPLAY_GRID_GUARD=0\)'
+        grep -q 'replay grid: the recorder would copy 0x3000 bytes' "$OUT/replay_grid.out" && echo "ok  : replay grid off: the recorder copies the whole state, as the game does" ||
+            { echo "FAIL: replay grid off: the state was changed"; status=1; }
+        count "replay grid off: nothing is logged about a skipped state" 0 '\[replay\] session has'
+    fi
+done
+for guard in on off; do
     echo "==== garage_crew ($guard)"
     code=0
-    SWOFTY_GARAGE_CREW_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" garage_crew >"$OUT/garage_crew.out" 2>&1 || code=$?
+    SWOFTY_GARAGE_CREW_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" garage_crew >"$OUT/garage_crew.out" 2>&1 || code=$?
     grep -E '\[garage\]' "$LOG" || true
     if [[ $guard == on ]]; then
         [[ $code == 0 ]] && echo "ok  : garage_crew on: the test run finished" || { echo "FAIL: garage_crew on: exit $code"; status=1; }
@@ -802,7 +909,7 @@ done
 for guard in on off; do
     echo "==== pit_slots ($guard)"
     code=0
-    SWOFTY_PIT_SLOT_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" pit_slots >"$OUT/pit_slots.out" 2>&1 || code=$?
+    SWOFTY_PIT_SLOT_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" pit_slots >"$OUT/pit_slots.out" 2>&1 || code=$?
     grep -E '\[pit\]' "$LOG" || true
     if [[ $guard == on ]]; then
         [[ $code == 0 ]] && echo "ok  : pit_slots on: the test run finished" || { echo "FAIL: pit_slots on: exit $code"; status=1; }
@@ -821,7 +928,7 @@ for guard in on off; do
     echo "==== leaderboard ($guard)"
     code=0
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
-    SWOFTY_LEADERBOARD_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" leaderboard >"$OUT/leaderboard.out" 2>&1 || code=$?
+    SWOFTY_LEADERBOARD_GUARD=$([[ $guard == off ]] && echo 0) timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" leaderboard >"$OUT/leaderboard.out" 2>&1 || code=$?
     grep -E '\[leaderboard\]|\[crash\] (unhandled |crash report [^:]*crash-[0-9])' "$LOG" || true
     if [[ $guard == on ]]; then
         once "leaderboard on: the view of an empty board list is skipped" '\[leaderboard\] Time Trial leaderboard view 0x[0-9a-f]+ has no board for this track'
@@ -842,7 +949,7 @@ echo "==== ntpage"
 cp "$OUT/t_ntpage.dll" "$SW/mods/core/ntpage_hook.dll"
 rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
 code=0
-timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" exit >"$OUT/ntpage.out" 2>&1 || code=$?
+timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" exit >"$OUT/ntpage.out" 2>&1 || code=$?
 rm -f "$SW/mods/core/ntpage_hook.dll"
 grep -F '[ntpage]' "$OUT/ntpage.out" || true
 grep -F '[crash]' "$LOG"
@@ -861,7 +968,7 @@ for skip in 0 1; do
     cp "$OUT/t_int3hook.dll" "$SW/mods/core/int3_hook.dll"
     rm -f "$SW"/crash-*.txt "$SW"/crash-*.dmp
     code=0
-    T_INT3_SKIP_WRITER=$skip timeout 120 "${PIN[@]}" xvfb-run -a wine "$OUT/game/F1_25.exe" crash >"$OUT/int3.out" 2>&1 || code=$?
+    T_INT3_SKIP_WRITER=$skip timeout 120 "${PIN[@]}" xvfb-run -a wine cmd /c "$OUT/game/F1_25.exe" crash >"$OUT/int3.out" 2>&1 || code=$?
     rm -f "$SW/mods/core/int3_hook.dll"
     grep -F '[int3]' "$OUT/int3.out" || true
     grep -F '[crash]' "$LOG"

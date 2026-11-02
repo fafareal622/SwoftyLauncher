@@ -16,7 +16,7 @@ The two cards at the top of the **Addons** page are the ways in:
 
 A file that isn't an addon, and that no addon such as the Simplified Importer imports, opens a dialog that names it. The dialog lists up to five files. **Go to Simplified Importer** opens the [Simplified Importer](/using/mods), and **Read the addon docs** opens the [addon reference](/reference/addons/) in your browser.
 
-The launcher copies the addon to `$DATA/addons/<id>/`, opens **Addons** and highlights it. Installing an addon with an id that's already installed replaces it. A new addon starts off in every profile.
+The launcher copies the addon to `$DATA/addons/<id>/`, opens **Addons** and highlights it. Installing an addon with an id that's already installed replaces it. A new addon joins only the active profile, turned off, at the end of the list. Installed from `vanilla`, it joins no profile.
 
 ## Find an addon
 
@@ -35,13 +35,19 @@ On a window less than 760 pixels tall, the install cards shrink to one row.
 
 ## Turn addons on or off
 
-Use the switch on a row to turn an addon on or off in the active [profile](/using/profiles). An addon keeps its place in the list when it is off; its row is dimmed and has no load order number. A new addon starts off in every profile. The next time you press **Play**, the launcher builds the profile with the change.
+Use the switch on a row to turn an addon on or off in the active [profile](/using/profiles). An addon keeps its place in the list when it is off; its row is dimmed and has no load order number. The next time you press **Play**, the launcher builds the profile with the change.
 
 Some addons, such as Driver Manager, change what your careers store. Turning one of those off asks first: careers you played with it may not load without it. Select **Turn off anyway** to go ahead, or **Cancel** to leave it on.
 
 **Turn off all** turns off every addon except those that show **Always on** and those that would ask about your saves; the launcher names those. **Undo** on the message that follows turns the same addons back on in their old order.
 
-In the `vanilla` profile the list is read-only. Switch to a modded profile to turn addons on.
+In the `vanilla` profile the list is read-only and shows every installed addon. Switch to a modded profile to turn addons on.
+
+## Add an addon to a profile
+
+Each modded profile lists only its own addons and the built-in ones. To use an addon you installed from another profile, select **Add addons** above the list, tick the ones you want and confirm, or select **Add to** with the profile's name on its card in the Addon Browser. It joins the profile turned off, at the end of the list.
+
+**Remove from** with the profile's name, in the addon's panel, takes it out of this profile only. It stays installed for your other profiles, and its settings come back if you add it again.
 
 ## Folders
 
@@ -73,7 +79,7 @@ Classic Career         Needs Classic Seasons (shared) above it     [Move Classic
 Progressive Career     Needs F1 2019, which is off                 [Turn F1 2019 on]
 Classic Career         Needs F1 2020, which isn't installed        [Install F1 2020]
 More Driver Models     Changes rows that Classic Seasons adds, so it needs Classic Seasons above it
-Supercars              Supercars adds teams to every session (with Pedro's Mugello)
+F1 2012 Season         F1 2012 has more teams than this track has garages (with Pedro's Mugello)
 ```
 
 - **Needs X above it** is a required addon, or one the addon loads after, listed below it. **Move X above** puts X directly above the row. **Order for me** reorders the whole profile with the smallest change that puts every addon below what it needs, and keeps the rest of your order. If addons need each other above themselves, the banner names them and **Order for me** is not offered.
@@ -83,7 +89,7 @@ Supercars              Supercars adds teams to every session (with Pedro's Mugel
 - Addons in Built In, such as Simplified for Swofty, don't move, so they get no **Needs X above it** or **Changes rows that X adds** box and **Order for me** leaves them in place. The build still loads them after every addon they require or load after.
 - **Your career K needs X, which is off** shows on X's row when a saved career lists X among the addons it needs. It also shows when X is not installed or outside the range the career needs.
 - An amber **loads below it and replaces N of its changes** is a conflict from the last check. **Move X above** makes the row win instead.
-- An amber clash is a known bad pairing, such as Supercars with a community track. The list is in `packages/core/src/order_clashes.json`.
+- An amber clash is a known bad pairing, such as F1 2012 Season with Mugello. The list is in `packages/core/src/order_clashes.json`.
 
 The Play log lists a required addon listed below its dependent as a warning. The build loads it first anyway.
 
@@ -107,13 +113,13 @@ Change a value under **Settings** in the addon's panel. **Reset to defaults** pu
 
 ## Remove an addon
 
-Select **Remove** in the addon's panel and confirm. Removing an addon deletes its files and takes it out of every profile. Built-in addons can't be removed.
+Select **Uninstall** in the addon's panel and confirm. Uninstalling an addon deletes its files and takes it out of every profile. Built-in addons can't be uninstalled.
 
 Removing a DB Editor addon deletes its changes. To keep them, select **Export** › **Share addon (.zip)** in the [DB Editor](/using/db-editor) first.
 
 ## Addons that can't be used
 
-An addon made for a newer Swofty Launcher, or one whose `swofty.json` is damaged, is listed under **Can't be used** with the reason, such as "It needs a newer Swofty Launcher (unknown field `hud`)". The launcher leaves it out of builds, and **Remove** deletes it. The rest of your addons work as before. Installing such an addon is refused with the same reason.
+An addon made for a newer Swofty Launcher, or one whose `swofty.json` is damaged, is listed under **Can't be used** with the reason, such as "It needs a newer Swofty Launcher (unknown field `hud`)". The launcher leaves it out of builds, and **Uninstall** deletes it. The rest of your addons work as before. Installing such an addon is refused with the same reason.
 
 A profile saved by a newer launcher keeps the settings this launcher doesn't know, and saves them back unchanged.
 

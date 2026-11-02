@@ -159,6 +159,11 @@ pub struct Shell {
     pub(crate) forms: HashMap<String, crate::blocks::FormSlot>,
     pub(crate) searches: HashMap<String, crate::blocks::SearchSlot>,
     pub(crate) sorts: HashMap<String, (String, bool)>,
+    /// User-resized table column widths, keyed by `(table_key, column_key)`.
+    pub(crate) column_widths: HashMap<(String, String), f32>,
+    /// Measured header widths from the last frame, keyed by `(table_key, column_key)`.
+    pub(crate) column_bounds: Rc<std::cell::RefCell<HashMap<(String, String), f32>>>,
+    pub(crate) column_drag: Option<crate::blocks::ColumnDrag>,
     /// The row whose detail panel is open, by table.
     pub(crate) table_rows: HashMap<String, String>,
     /// The scroll position and wheel motion of each addon page of blocks, by addon/section.
@@ -410,18 +415,29 @@ impl Shell {
             .detach();
         let poll = cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok((store, rediscover, seen, profile, banner_due)) = this.update(cx, |s, _| {
-                    let r = std::mem::take(&mut s.rediscover);
-                    let profile = s.library.profile.name.clone();
-                    let due = r || s.saves.banner_profile != profile;
-                    (s.store.clone(), r, s.requests, profile, due)
-                }) else {
+                let Ok((store, rediscover, seen, profile, banner_due, saves_open)) =
+                    this.update(cx, |s, _| {
+                        let r = std::mem::take(&mut s.rediscover);
+                        let profile = s.library.profile.name.clone();
+                        let due = r || s.saves.banner_profile != profile || game::banner_stale();
+                        (
+                            s.store.clone(),
+                            r,
+                            s.requests,
+                            profile,
+                            due,
+                            s.page == Page::Careers,
+                        )
+                    })
+                else {
                     break;
                 };
-                let probe = cx
-                    .background_executor()
-                    .spawn(async move { game::probe(&store, rediscover, seen, &profile, banner_due) })
-                    .await;
+                let probe =
+                    cx.background_executor()
+                        .spawn(async move {
+                            game::probe(&store, rediscover, seen, &profile, banner_due, saves_open)
+                        })
+                        .await;
                 if this
                     .update_in(cx, |s, window, cx| s.apply(probe, window, cx))
                     .is_err()
@@ -554,6 +570,9 @@ impl Shell {
             forms: HashMap::new(),
             searches: HashMap::new(),
             sorts: HashMap::new(),
+            column_widths: HashMap::new(),
+            column_bounds: Rc::default(),
+            column_drag: None,
             table_rows: HashMap::new(),
             section_scrolls: HashMap::new(),
             table_tops: Rc::default(),
@@ -680,6 +699,12 @@ impl Shell {
             self.saves.banner_profile = probe.banner_profile;
         }
         self.saves.game_running = !probe.processes.is_empty();
+        if self
+            .saves
+            .refresh_due(self.page == Page::Careers, probe.saves_print)
+        {
+            self.refresh_saves_in_background(cx);
+        }
         if probe.saves_marker && self.saves.take_notice(&root) {
             self.show_saves_notice(window, cx);
         }
@@ -733,8 +758,8 @@ impl Shell {
             self.copies = found.all;
             self.missing_copies = found.missing;
             self.detected = true;
-            if self.page == Page::Careers {
-                self.refresh_saves();
+            if self.page == Page::Careers && (changed || probe.merged) {
+                self.refresh_saves_in_background(cx);
             }
             if probe.merged {
                 self.reload(cx);
@@ -1433,29 +1458,243 @@ impl Shell {
             let alert = match &warning {
                 Some(w) => saves_alert(alert, w, Some(removes), p).ok_text("Remove anyway"),
                 None => alert
-                    .title(format!("Remove {name}?"))
+                    .title(format!("Uninstall {name}?"))
                     .description(removes)
-                    .ok_text("Remove addon"),
+                    .ok_text("Uninstall"),
             };
             alert
                 .ok_variant(ButtonVariant::Danger)
                 .show_cancel(true)
                 .on_ok(move |_, window, cx| {
-                    match store.remove_addon(&id) {
+                    let (shell, store, id, name) = (shell.clone(), store.clone(), id.clone(), name.clone());
+                    window
+                        .spawn(cx, async move |cx| {
+                            let removing = id.clone();
+                            let removed = cx
+                                .background_executor()
+                                .spawn(async move { store.remove_addon(&removing) })
+                                .await;
+                            cx.update(|window, cx| match removed {
+                                Ok(()) => {
+                                    window.push_notification(
+                                        Notification::success(format!("Removed {name}")),
+                                        cx,
+                                    );
+                                    shell
+                                        .update(cx, |s, cx| {
+                                            s.open_addon = None;
+                                            s.reload_in_background(cx);
+                                        })
+                                        .ok();
+                                }
+                                Err(e) => {
+                                    crate::app_log::action("remove addon").addon(&id).failed(&e);
+                                    window.push_notification(Notification::error(e.to_string()), cx);
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    true
+                })
+        });
+    }
+
+    /// Takes `id` out of this profile; it stays installed for the others.
+    pub(crate) fn remove_from_profile(
+        &mut self,
+        id: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const KEEPS: &str = "It stays installed for your other profiles, and you can add it back \
+                             with Add addons.";
+        let registry = self.library.registry.clone();
+        let warning = self
+            .library
+            .profile
+            .enabled()
+            .any(|e| e == id)
+            .then(|| registry.turn_off_warning(&self.library.profile, id))
+            .flatten();
+        let Some(warning) = warning else {
+            self.take_out_of_profile(id, name, window, cx);
+            return;
+        };
+        let shell = cx.entity().downgrade();
+        let (id, name) = (id.to_owned(), name.to_owned());
+        let p = palette(cx);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (shell, id, name) = (shell.clone(), id.clone(), name.clone());
+            saves_alert(alert, &warning, Some(KEEPS), p)
+                .ok_text("Remove anyway")
+                .on_ok(move |_, window, cx| {
+                    shell
+                        .update(cx, |s, cx| s.take_out_of_profile(&id, &name, window, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    fn take_out_of_profile(&mut self, id: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let registry = self.library.registry.clone();
+        let profile = self.library.profile.name.clone();
+        let removed = self.store.update_profile(&profile, |p| {
+            if p.enabled().any(|e| e == id) {
+                registry.set_enabled(p, id, false)?;
+            }
+            p.remove_addon(id)
+        });
+        match removed {
+            Ok(()) => {
+                self.open_addon = None;
+                window.push_notification(
+                    Notification::success(format!("Removed {name} from {profile}")),
+                    cx,
+                );
+            }
+            Err(e) => {
+                crate::app_log::action("remove addon from profile")
+                    .addon(id)
+                    .failed(&e);
+                window.push_notification(Notification::error(e.to_string()), cx);
+            }
+        }
+        self.reload(cx);
+    }
+
+    /// Picks installed addons this profile doesn't have and adds them, off.
+    pub(crate) fn add_to_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut offered: Vec<(String, String, String)> = self
+            .library
+            .not_in_profile()
+            .map(|m| {
+                let man = &m.manifest;
+                let detail = match man.author.trim() {
+                    "" | "Unknown" => man.version.to_string(),
+                    author => format!("{} · by {author}", man.version),
+                };
+                (man.id.clone(), man.name.clone(), detail)
+            })
+            .collect();
+        offered.sort_by_cached_key(|(_, name, _)| name.to_lowercase());
+        let profile = self.library.profile.name.clone();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search installed addons"));
+        let chosen: Rc<std::cell::RefCell<BTreeSet<String>>> = Rc::default();
+        let shell = cx.entity().downgrade();
+        let store = self.store.clone();
+        let focus = std::cell::Cell::new(true);
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            if focus.replace(false) {
+                search.update(cx, |s, cx| s.focus(window, cx));
+            }
+            let p = palette(cx);
+            let query = search.read(cx).value().trim().to_lowercase();
+            let rows: Vec<AnyElement> = offered
+                .iter()
+                .filter(|(id, name, _)| {
+                    query.is_empty() || name.to_lowercase().contains(&query) || id.contains(&query)
+                })
+                .map(|(id, name, detail)| {
+                    let on = chosen.borrow().contains(id);
+                    let (chosen, id) = (chosen.clone(), id.clone());
+                    h_flex()
+                        .id(SharedString::from(format!("add-to-profile-{id}")))
+                        .gap(px(10.))
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(p.hover))
+                        .child(crate::addons::checkbox(on, p))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_size(px(13.)).text_color(p.text).truncate().child(name.clone()))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(p.text_muted)
+                                        .truncate()
+                                        .child(detail.clone()),
+                                ),
+                        )
+                        .on_click(move |_, window, _| {
+                            let mut chosen = chosen.borrow_mut();
+                            if !chosen.remove(&id) {
+                                chosen.insert(id.clone());
+                            }
+                            window.refresh();
+                        })
+                        .into_any_element()
+                })
+                .collect();
+            let list = match rows.is_empty() {
+                true => div()
+                    .py(px(24.))
+                    .text_size(px(13.))
+                    .text_color(p.text_muted)
+                    .text_center()
+                    .child(if offered.is_empty() {
+                        "Every installed addon is already in this profile"
+                    } else {
+                        "No installed addons match"
+                    })
+                    .into_any_element(),
+                false => v_flex()
+                    .max_h(px(360.))
+                    .pr(px(SCROLLBAR_GAP))
+                    .children(rows)
+                    .scroll_y("add-to-profile-list")
+                    .into_any_element(),
+            };
+            let picked: Vec<String> = offered
+                .iter()
+                .map(|(id, ..)| id)
+                .filter(|id| chosen.borrow().contains(*id))
+                .cloned()
+                .collect();
+            let (shell, store, profile) = (shell.clone(), store.clone(), profile.clone());
+            let ok = match picked.len() {
+                0 => "Add".to_owned(),
+                n => format!("Add {}", crate::library::plural(n, "addon", "addons")),
+            };
+            alert
+                .width(px(520.))
+                .title(format!("Add addons to {profile}"))
+                .description(
+                    "Installed addons this profile doesn't have. They're added off, at the end of the load order.",
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap(px(10.))
+                        .child(Input::new(&search).cleanable(true))
+                        .child(list),
+                )
+                .ok_text(ok)
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    if picked.is_empty() {
+                        return true;
+                    }
+                    match store.update_profile(&profile, |p| picked.iter().try_for_each(|id| p.add_addon(id))) {
                         Ok(()) => {
-                            window.push_notification(Notification::success(format!("Removed {name}")), cx);
-                            shell
-                                .update(cx, |s, cx| {
-                                    s.open_addon = None;
-                                    s.reload(cx);
-                                })
-                                .ok();
+                            let text = format!(
+                                "Added {} to {profile}",
+                                crate::library::plural(picked.len(), "addon", "addons")
+                            );
+                            window.push_notification(Notification::success(text), cx);
                         }
                         Err(e) => {
-                            crate::app_log::action("remove addon").addon(&id).failed(&e);
+                            crate::app_log::action("add addons to profile").failed(&e);
                             window.push_notification(Notification::error(e.to_string()), cx);
                         }
                     }
+                    shell.update(cx, |s, cx| s.reload(cx)).ok();
                     true
                 })
         });
@@ -1746,8 +1985,9 @@ impl Shell {
             self.cancel_scroll();
         }
         self.db_page_change(page, cx);
+        let was = self.page;
         self.page = page;
-        if page == Page::Careers {
+        if page == Page::Careers && was != Page::Careers {
             self.refresh_saves_in_background(cx);
         }
         if let Some(i) = self.open_section().filter(|i| !self.section_loaded(*i)) {
@@ -2040,6 +2280,7 @@ impl Shell {
                         ),
                 ),
             )
+            .child(crate::donate::button())
             .child(self.send_logs_button(p, cx))
             .child(
                 v_flex()
