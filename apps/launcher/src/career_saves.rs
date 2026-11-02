@@ -45,9 +45,11 @@ pub(crate) struct SavesPage {
     generation: u64,
     pub loading: bool,
     pub banner_profile: String,
+    print: Option<u64>,
 }
 
 pub(crate) struct Built {
+    print: u64,
     banner: Option<Banner>,
     running: bool,
     view: SavesView,
@@ -61,7 +63,29 @@ pub(crate) enum Banner {
         kept_at: i64,
         names: Vec<String>,
     },
+    Lost {
+        profile: String,
+        source: String,
+        snapshot: String,
+        kept_at: i64,
+        names: Vec<String>,
+    },
     Hint(Notice),
+}
+
+impl Banner {
+    pub(crate) fn lost(&self) -> Option<(&[String], &str, &str, i64)> {
+        match self {
+            Self::Lost {
+                names,
+                source,
+                snapshot,
+                kept_at,
+                ..
+            } => Some((names, source, snapshot, *kept_at)),
+            _ => None,
+        }
+    }
 }
 
 struct Version {
@@ -101,6 +125,7 @@ pub(crate) struct SavesView {
     steam_running: bool,
     awaiting_import: bool,
     steam_missing: bool,
+    steam_warning: bool,
 }
 
 impl SavesView {
@@ -126,8 +151,13 @@ impl SavesPage {
         banner_from(root, source_of_profile(root, profile)?, profile.to_owned())
     }
 
+    pub(crate) fn refresh_due(&self, shown: bool, print: Option<u64>) -> bool {
+        shown && !self.loading && print.is_some_and(|p| self.print != Some(p))
+    }
+
     fn apply(&mut self, built: Built) {
         self.loading = false;
+        self.print = Some(built.print);
         self.banner_profile = built.view.profile.clone();
         self.banner = built.banner;
         self.game_running = built.running;
@@ -185,7 +215,11 @@ pub(crate) fn steam_save_in(folder: &Path) -> Option<Location> {
 }
 
 pub(crate) fn source_of_profile(root: &Path, profile: &str) -> Option<String> {
-    match profile == VANILLA {
+    let steam_saves = profile == VANILLA
+        || !Store::new(root.to_path_buf())
+            .profile(profile)
+            .map_or(true, |p| p.launcher_saves);
+    match steam_saves {
         true => Location::active(root).map(|l| l.source),
         false => Some(Location::launcher(root, profile).source),
     }
@@ -216,6 +250,15 @@ fn banner_from(root: &Path, source: String, profile: String) -> Option<Banner> {
             snapshot: newest.last_seen.clone(),
             kept_at: newest.last_seen_at,
             names: shown.iter().map(|r| row_name(r)).collect(),
+        });
+    }
+    if let Some(loss) = v.probable_loss() {
+        return Some(Banner::Lost {
+            profile,
+            source,
+            snapshot: loss.snapshot.clone(),
+            kept_at: loss.at,
+            names: loss.names(),
         });
     }
     Notice::read(root).map(Banner::Hint)
@@ -335,38 +378,148 @@ fn short_block(layout: vault::Layout, r: Running) -> Option<&'static str> {
     }
 }
 
-type Indexed = (
-    Option<Vec<String>>,
-    Option<Vec<swofty_core::stdlib::careers::Career>>,
-);
+#[derive(Clone, Default)]
+struct Detail {
+    held: Option<Vec<String>>,
+    diff: Option<Diff>,
+}
 
-static INDEXES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Indexed>>> =
+type Stamp = Option<(u64, std::time::SystemTime)>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct DetailKey {
+    careers_ref: Option<String>,
+    index: Stamp,
+    now: Stamp,
+}
+
+#[derive(Default)]
+struct DetailCache(std::collections::HashMap<PathBuf, (DetailKey, Detail)>);
+
+static DETAILS: std::sync::LazyLock<std::sync::Mutex<DetailCache>> =
     std::sync::LazyLock::new(Default::default);
 
-fn indexed(v: &Vault, snap: &Snapshot) -> Indexed {
-    let key = v.dir.join(&snap.id);
-    if let Some(hit) = INDEXES.lock().ok().and_then(|m| m.get(&key).cloned()) {
-        return hit;
-    }
-    let index = v.index_of(snap);
-    let held = index.as_ref().map(|i| {
-        vault::careers::in_save(i)
-            .map(|c| match c.label.is_empty() {
-                true => c.career.clone(),
-                false => c.label.clone(),
-            })
-            .collect()
-    });
-    let out = (held, index);
-    if let Ok(mut m) = INDEXES.lock() {
-        m.insert(key, out.clone());
+fn stamp(path: &Path) -> Stamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+fn details(
+    v: &Vault,
+    snaps: &[Snapshot],
+    now_path: &Path,
+    cache: &std::sync::Mutex<DetailCache>,
+) -> Vec<Detail> {
+    let now_stamp = stamp(now_path);
+    let mut now: Option<Vec<swofty_core::stdlib::careers::Career>> = None;
+    let mut parsed: std::collections::HashMap<
+        String,
+        Option<std::sync::Arc<Vec<swofty_core::stdlib::careers::Career>>>,
+    > = Default::default();
+    let mut seen = std::collections::HashSet::new();
+    let out = snaps
+        .iter()
+        .map(|snap| {
+            let path = v.dir.join(&snap.id);
+            seen.insert(path.clone());
+            let key = DetailKey {
+                careers_ref: snap.careers_ref.clone(),
+                index: snap
+                    .careers_ref
+                    .as_deref()
+                    .filter(|r| !r.contains("..") && !r.starts_with('/'))
+                    .and_then(|r| stamp(&v.dir.join(r))),
+                now: now_stamp,
+            };
+            if let Some((k, d)) = cache.lock().ok().and_then(|c| c.0.get(&path).cloned())
+                && k == key
+            {
+                return d;
+            }
+            let now = now.get_or_insert_with(|| swofty_core::stdlib::careers::read(now_path));
+            let index = snap.careers_ref.as_deref().and_then(|r| {
+                parsed
+                    .entry(r.to_owned())
+                    .or_insert_with(|| v.index_of(snap).map(std::sync::Arc::new))
+                    .clone()
+            });
+            let held = index.as_ref().map(|i| {
+                vault::careers::in_save(i)
+                    .map(|c| match c.label.is_empty() {
+                        true => c.career.clone(),
+                        false => c.label.clone(),
+                    })
+                    .collect()
+            });
+            let diff = index
+                .filter(|_| !now.is_empty())
+                .map(|i| vault::careers::diff(now, &i));
+            let detail = Detail { held, diff };
+            if let Ok(mut c) = cache.lock() {
+                c.0.insert(path, (key, detail.clone()));
+            }
+            detail
+        })
+        .collect();
+    if let Ok(mut c) = cache.lock() {
+        c.0.retain(|p, _| !p.starts_with(&v.dir) || seen.contains(p));
     }
     out
 }
 
-fn build_saves(store: &Store, install: Option<&crate::game::Install>, name: &str) -> Built {
+fn tag(h: &mut impl std::hash::Hasher, path: &Path) {
+    use std::hash::Hash;
+    path.hash(h);
+    stamp(path).hash(h);
+}
+
+fn tag_folder(h: &mut impl std::hash::Hasher, dir: &Path) {
+    use std::hash::Hash;
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name() != ".lock")
+        .collect();
+    files.sort_by_key(|e| e.file_name());
+    for e in files {
+        e.file_name().hash(h);
+        e.metadata()
+            .ok()
+            .map(|m| (m.len(), m.modified().ok(), m.is_dir()))
+            .hash(h);
+    }
+}
+
+pub(crate) fn saves_print(root: &Path, profile: &str, game_running: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (profile, game_running).hash(&mut h);
+    tag(&mut h, &swofty_core::stdlib::careers::data_path(root));
+    let sources = match profile == VANILLA {
+        true => Vault::sources(root),
+        false => vec![Location::launcher(root, profile).source],
+    };
+    for source in sources {
+        let dir = Vault::root(root).join(&source);
+        tag_folder(&mut h, &dir);
+        tag_folder(&mut h, &dir.join("snapshots"));
+    }
+    if profile != VANILLA {
+        tag_folder(&mut h, &launcher_saves::remote_dir(root, profile));
+    }
+    tag_folder(&mut h, &root.join("profiles"));
+    h.finish()
+}
+
+fn build_saves(
+    store: &Store,
+    install: Option<&crate::game::Install>,
+    name: &str,
+    game_running: bool,
+) -> Built {
     let started = std::time::Instant::now();
-    let built = build_saves_untimed(store, install, name);
+    let built = build_saves_untimed(store, install, name, game_running);
     crate::app_log::note(&format!(
         "saves: page loaded in {} ms ({} snapshots)",
         started.elapsed().as_millis(),
@@ -375,11 +528,16 @@ fn build_saves(store: &Store, install: Option<&crate::game::Install>, name: &str
     built
 }
 
-fn build_saves_untimed(store: &Store, install: Option<&crate::game::Install>, name: &str) -> Built {
+fn build_saves_untimed(
+    store: &Store,
+    install: Option<&crate::game::Install>,
+    name: &str,
+    game_running: bool,
+) -> Built {
+    let print = saves_print(&store.root, name, game_running);
     let root = store.root.clone();
     let name = name.to_owned();
     let banner = SavesPage::banner_for(&root, &name);
-    let running = Running::now();
     let active_loc = Location::active(&root);
     let vanilla = name == VANILLA;
     let loc = match vanilla {
@@ -400,15 +558,19 @@ fn build_saves_untimed(store: &Store, install: Option<&crate::game::Install>, na
     });
     let (versions, dir, usage, cap) = match vault {
         Some(v) => {
-            let now = swofty_core::stdlib::careers::read(&swofty_core::stdlib::careers::data_path(&root));
+            let found = details(
+                &v,
+                &snaps,
+                &swofty_core::stdlib::careers::data_path(&root),
+                &DETAILS,
+            );
             let versions = snaps
                 .into_iter()
-                .map(|snap| {
-                    let (held, index) = indexed(&v, &snap);
-                    let diff = index
-                        .filter(|_| !now.is_empty())
-                        .map(|i| vault::careers::diff(&now, &i));
-                    Version { snap, held, diff }
+                .zip(found)
+                .map(|(snap, d)| Version {
+                    snap,
+                    held: d.held,
+                    diff: d.diff,
                 })
                 .collect();
             (versions, v.dir.clone(), v.usage(), v.policy.cap_bytes)
@@ -433,6 +595,19 @@ fn build_saves_untimed(store: &Store, install: Option<&crate::game::Install>, na
         steam.as_ref().is_some_and(launcher_saves::has_files),
         launcher_saves::import_pending(&root),
     ) && launcher_saves::steam_save_pending(&root, &name);
+    let steam_running = steam.as_ref().is_some_and(|_| {
+        swofty_core::steam_client::status().state != swofty_core::steam_client::State::Stopped
+    });
+    let steam_warning = store.profile(&name).is_ok_and(|p| {
+        swofty_core::vault::guard::steam_save_warning(
+            vanilla,
+            p.launcher_saves,
+            &careers::addon_careers(
+                &swofty_core::stdlib::careers::read(&swofty_core::stdlib::careers::data_path(&root)),
+                Some(&name),
+            ),
+        )
+    });
     let view = SavesView {
         steam,
         profile: name,
@@ -445,23 +620,20 @@ fn build_saves_untimed(store: &Store, install: Option<&crate::game::Install>, na
         dir,
         usage,
         cap,
-        steam_running: running.steam,
+        steam_running,
         awaiting_import,
         steam_missing,
+        steam_warning,
     };
     Built {
+        print,
         banner,
-        running: running.game,
+        running: game_running,
         view,
     }
 }
 
 impl Shell {
-    pub(crate) fn refresh_saves(&mut self) {
-        let built = build_saves(&self.store, self.install.as_ref(), &self.library.profile.name);
-        self.saves.apply(built);
-    }
-
     pub(crate) fn refresh_saves_in_background(&mut self, cx: &mut Context<Self>) {
         self.saves.generation += 1;
         self.saves.loading = true;
@@ -469,10 +641,11 @@ impl Shell {
         let store = self.store.clone();
         let install = self.install.clone();
         let name = self.library.profile.name.clone();
+        let game_running = self.saves.game_running;
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { build_saves(&store, install.as_ref(), &name) })
+                .spawn(async move { build_saves(&store, install.as_ref(), &name, game_running) })
                 .await;
             this.update(cx, |s, cx| {
                 if s.saves.generation == generation {
@@ -592,7 +765,7 @@ impl Shell {
             }
         };
         window.push_notification(note, cx);
-        self.refresh_saves();
+        self.refresh_saves_in_background(cx);
         cx.notify();
     }
 
@@ -634,7 +807,7 @@ impl Shell {
             }
         };
         window.push_notification(note, cx);
-        self.refresh_saves();
+        self.refresh_saves_in_background(cx);
         cx.notify();
     }
 
@@ -672,6 +845,32 @@ impl Shell {
                 snapshot.clone(),
                 *kept_at,
             ),
+            Banner::Lost {
+                profile,
+                source,
+                snapshot,
+                kept_at,
+                names,
+            } => (
+                format!(
+                    "{} may have been removed from your Steam save when F1 25 started without the launcher: {}. \
+                     The last version that held {} is from {}.",
+                    match names.len() {
+                        1 => "1 addon career".to_owned(),
+                        n => format!("{n} addon careers"),
+                    },
+                    names.join("; "),
+                    match names.len() {
+                        1 => "it",
+                        _ => "them",
+                    },
+                    vault::human(*kept_at),
+                ),
+                profile.clone(),
+                source.clone(),
+                snapshot.clone(),
+                *kept_at,
+            ),
             Banner::Hint(n) => (
                 n.headline(),
                 profile_of_source(&n.source),
@@ -681,7 +880,10 @@ impl Shell {
             ),
         };
         let hint = matches!(banner, Banner::Hint(_));
+        let lost = matches!(banner, Banner::Lost { .. });
+        let restorable = !hint;
         let review = snapshot.clone();
+        let restore = (source.clone(), snapshot.clone());
         let _ = kept_at;
         let _ = profile;
         let dismiss_source = source;
@@ -700,6 +902,16 @@ impl Shell {
                         .text_color(p.warning),
                 )
                 .child(div().flex_1().min_w_0().child(text))
+                .when(restorable, |row| {
+                    row.child(
+                        Button::new("saves-banner-restore")
+                            .small()
+                            .label("Restore")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.restore_version(&restore.0, &restore.1, window, cx);
+                            })),
+                    )
+                })
                 .child(
                     Button::new("saves-banner-review")
                         .outline()
@@ -724,8 +936,11 @@ impl Shell {
                             }
                             if let Ok(v) = Vault::open(&root, &dismiss_source) {
                                 v.dismiss_drop().ok();
+                                if lost {
+                                    v.dismiss_loss().ok();
+                                }
                             }
-                            this.refresh_saves();
+                            this.refresh_saves_in_background(cx);
                             cx.notify();
                         })),
                 ),
@@ -774,7 +989,7 @@ impl Shell {
             }
         };
         window.push_notification(note, cx);
-        self.refresh_saves();
+        self.refresh_saves_in_background(cx);
         cx.notify();
     }
 
@@ -787,7 +1002,7 @@ impl Shell {
         if let Err(e) = done {
             crate::app_log::action("pin a version").failed(&e);
         }
-        self.refresh_saves();
+        self.refresh_saves_in_background(cx);
         cx.notify();
     }
 
@@ -958,12 +1173,14 @@ impl Shell {
         let footer = self.storage_line(view, p, cx);
         let empty = self.empty_save_notice(view, p, cx);
         let missing = self.steam_missing_notice(view, p, cx);
+        let warning = self.steam_warning_notice(view, p, cx);
         v_flex()
             .size_full()
             .child(self.header(title, subtitle, actions, p))
             .children(banner)
             .children(empty)
             .children(missing)
+            .children(warning)
             .child(
                 div()
                     .flex_1()
@@ -1014,6 +1231,50 @@ impl Shell {
         )
     }
 
+    fn steam_warning_notice(&self, view: &SavesView, p: Palette, cx: &mut Context<Self>) -> Option<Div> {
+        if !view.steam_warning {
+            return None;
+        }
+        let turn_on = !view.has_save;
+        Some(
+            h_flex()
+                .mx(px(GUTTER))
+                .mb(px(8.))
+                .px(px(12.))
+                .py(px(8.))
+                .gap(px(8.))
+                .items_center()
+                .flex_wrap()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(p.border)
+                .text_size(px(13.))
+                .text_color(p.text_muted)
+                .child(
+                    Icon::new(IconName::CircleAlert)
+                        .size(px(15.))
+                        .text_color(p.warning),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(240.))
+                        .child(swofty_core::vault::guard::STEAM_SAVE_WARNING),
+                )
+                .when(turn_on, |row| {
+                    row.child(
+                        Button::new("saves-warning-launcher-saves")
+                            .small()
+                            .label("Use launcher saves")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_launcher_saves(true, window, cx);
+                                this.refresh_saves_in_background(cx);
+                            })),
+                    )
+                }),
+        )
+    }
+
     fn steam_missing_notice(&self, view: &SavesView, p: Palette, cx: &mut Context<Self>) -> Option<Div> {
         if !view.steam_missing {
             return None;
@@ -1044,7 +1305,7 @@ impl Shell {
                             .label("Play with your Steam saves")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.set_launcher_saves(false, window, cx);
-                                this.refresh_saves();
+                                this.refresh_saves_in_background(cx);
                             })),
                     )
                 })
@@ -1073,7 +1334,7 @@ impl Shell {
 
     fn retry_steam_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         crate::game::import_now(&self.store);
-        self.refresh_saves();
+        self.refresh_saves_in_background(cx);
         let found = !self.saves.view.as_ref().is_some_and(|v| v.steam_missing);
         window.push_notification(
             match found {
@@ -1562,9 +1823,144 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         let store = swofty_core::store::Store::new(&root);
-        let built = build_saves(&store, None, "Race");
+        let built = build_saves(&store, None, "Race", false);
         assert_eq!(built.view.profile, "Race");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn synthetic_vault(root: &std::path::Path, profile: &str, snapshots: usize) {
+        let index = swofty_core::stdlib::careers::data_path(root);
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        let loc = vault::Location::launcher(root, profile);
+        std::fs::create_dir_all(&loc.dir).unwrap();
+        let v = Vault::of(root, &loc).unwrap();
+        for n in 0..snapshots {
+            let careers: Vec<String> = (0..400 + n)
+                .map(|c| {
+                    format!(
+                        r#"{{"career":"driver_career:s{c}","profile":"{profile}","slot":"s{c}","status":"present","mode":"driver_career","driver":"Driver {c}","team":"Team {c}","driver_raw":{c},"team_raw":{c},"slot_season":3,"slot_weekend":4,"last_played":1761600000,"slot_name":"Slot {c}",{}}}"#,
+                        (0..40).map(|f| format!(r#""field_{f}":"value {f} of career {c}""#)).collect::<Vec<_>>().join(",")
+                    )
+                })
+                .collect();
+            std::fs::write(
+                &index,
+                format!(r#"{{"version":1,"careers":[{}]}}"#, careers.join(",")),
+            )
+            .unwrap();
+            std::fs::write(
+                loc.dir.join("savegame@profile#NXDSMWW.BWW"),
+                vec![n as u8; 4096 + n],
+            )
+            .unwrap();
+            v.snapshot(
+                &loc,
+                vault::Meta::new(vault::Reason::AfterSession),
+                1_793_404_800 + n as i64 * 600,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_hidden_or_unchanged_saves_page_is_not_refreshed() {
+        let mut page = SavesPage::default();
+        assert!(page.refresh_due(true, Some(1)));
+        assert!(!page.refresh_due(false, Some(1)));
+        assert!(!page.refresh_due(true, None));
+        page.print = Some(1);
+        assert!(!page.refresh_due(true, Some(1)));
+        assert!(page.refresh_due(true, Some(2)));
+        page.loading = true;
+        assert!(!page.refresh_due(true, Some(2)));
+    }
+
+    #[test]
+    fn the_print_follows_the_vault_and_the_save_folder_and_nothing_else() {
+        let root = std::env::temp_dir().join(format!("swofty-print-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        synthetic_vault(&root, "Race", 2);
+        let print = |game| super::saves_print(&root, "Race", game);
+        let first = print(false);
+        assert_eq!(first, print(false));
+        assert_ne!(first, print(true));
+        assert_eq!(print(false), super::saves_print(&root, "Race", false));
+        let loc = vault::Location::launcher(&root, "Race");
+        std::fs::write(loc.dir.join("savegame@profile#NXDSMWW.BWW"), vec![9u8; 7000]).unwrap();
+        let changed = print(false);
+        assert_ne!(first, changed);
+        let v = Vault::of(&root, &loc).unwrap();
+        v.snapshot(&loc, vault::Meta::new(vault::Reason::Manual), 1_793_500_000)
+            .unwrap();
+        assert_ne!(changed, print(false));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn snapshot_details_are_cached_until_the_index_or_the_current_careers_change() {
+        let root = std::env::temp_dir().join(format!("swofty-details-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        synthetic_vault(&root, "Race", 3);
+        let loc = vault::Location::launcher(&root, "Race");
+        let v = Vault::of(&root, &loc).unwrap();
+        let snaps = v.list().unwrap();
+        let now = swofty_core::stdlib::careers::data_path(&root);
+        let cache = std::sync::Mutex::new(super::DetailCache::default());
+        let first = super::details(&v, &snaps, &now, &cache);
+        assert_eq!(first.len(), 3);
+        assert_eq!(cache.lock().unwrap().0.len(), 3);
+
+        let index = v.dir.join(snaps[0].careers_ref.as_deref().unwrap());
+        let held = first[0].held.clone();
+        std::fs::write(
+            &index,
+            r#"{"careers":[{"career":"x:1","slot":"1","status":"present"}]}"#,
+        )
+        .unwrap();
+        let again = super::details(&v, &snaps, &now, &cache);
+        assert_ne!(again[0].held, held, "a changed index file is read again");
+        assert_eq!(again[1].held, first[1].held, "the others stay cached");
+
+        let before = again[2].diff.clone();
+        std::fs::write(
+            &now,
+            r#"{"careers":[{"career":"y:2","slot":"2","status":"present"}]}"#,
+        )
+        .unwrap();
+        let after = super::details(&v, &snaps, &now, &cache);
+        assert_ne!(
+            after[2].diff, before,
+            "a changed current index recomputes every diff"
+        );
+
+        let fewer = super::details(&v, &snaps[..1], &now, &cache);
+        assert_eq!(fewer.len(), 1);
+        assert_eq!(
+            cache.lock().unwrap().0.len(),
+            1,
+            "snapshots that are gone leave the cache"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_saves_page_with_25_snapshots() {
+        let root = std::path::PathBuf::from(
+            std::env::var("SAVES_BENCH_DIR").unwrap_or_else(|_| "/mnt/work/.saves-perf-bench".into()),
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        synthetic_vault(&root, "Race", 25);
+        let store = swofty_core::store::Store::new(&root);
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let built = build_saves(&store, None, "Race", false);
+            assert_eq!(built.view.versions.len(), 25);
+            eprintln!("bench round {round}: {} ms", started.elapsed().as_millis());
+        }
     }
 
     #[test]
@@ -1634,6 +2030,48 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
         std::fs::create_dir_all(d.join("career-vault/steam-1")).unwrap();
         d
+    }
+
+    #[test]
+    fn the_banner_names_an_addon_career_a_start_outside_the_launcher_probably_removed() {
+        let d = std::env::temp_dir().join(format!("swofty-launcher-saves-lost-{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        let remote = d
+            .join("steam")
+            .join("userdata")
+            .join("843502855")
+            .join("3059520")
+            .join("remote");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(remote.join("savegame@profile#NXDSMWW.BWW"), vec![1u8; 4000]).unwrap();
+        let index = swofty_core::stdlib::careers::data_path(&d);
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(
+            &index,
+            r#"{"careers":[{"career":"progressive:7f","slot":"7f","status":"present","mode":"progressive","label":"Progressive 2016","addons":[{"id":"swofty.progressive"}]}]}"#,
+        )
+        .unwrap();
+        let loc = vault::Location::steam(&remote).unwrap();
+        let v = Vault::of(&d, &loc).unwrap();
+        let meta = |r| vault::Meta::new(r);
+        v.snapshot(&loc, meta(vault::Reason::AfterSession), 1_000)
+            .unwrap();
+        std::fs::write(remote.join("savegame@profile#NXDSMWW.BWW"), vec![2u8; 900]).unwrap();
+        v.snapshot(&loc, meta(vault::Reason::ForeignExit), 2_000).unwrap();
+        match banner_from(&d, loc.source.clone(), "p".into()) {
+            Some(Banner::Lost {
+                names,
+                kept_at,
+                source,
+                ..
+            }) => {
+                assert_eq!(names, ["Progressive 2016"]);
+                assert_eq!(kept_at, 1_000);
+                assert_eq!(source, loc.source);
+            }
+            _ => panic!("expected a lost banner"),
+        }
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

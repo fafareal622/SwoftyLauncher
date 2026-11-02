@@ -252,7 +252,7 @@ A copy keeps its id from build to build, so a career keeps its cars, teams and d
 - A copy the file has no id for takes, at a profile's first build with the file, the id the profile's last build gave the row with its label, or, for a new profile, the newest build of any profile. The last build's rows are read from its database file and from the database edits in its `swofty/assets.json`, where a build that loads the database in game puts them.
 - Any other new copy takes the next free id above the table's rows, in load order, as builds before 1.6.10 gave it, passing over the ids the file keeps for other rows and the ids the core's `ids.json` holds. A fresh install with the same addons in the same order gives a save made before 1.6.10 its ids back, and two installs that build the same addons in the same order from an empty file get the same ids.
 - An addon that is turned off or removed keeps its rows' ids. Turned back on, its rows get them back. An update that adds a row gives the new row a new id and leaves the others alone.
-- A kept id that a row of the database, the core's `ids.json` or the table's ceiling now rules out moves to the next free id.
+- A kept id that a row of the database, the core's `ids.json` or the table's ceiling now rules out moves to the next free id, in that profile only. The new id is kept under `profiles.<profile>` in the file; the install-wide id stays in `rows`, so every other profile keeps the id its careers hold, and a profile with no entry of its own reads the install-wide one. The id a row moved from is kept as an alias in the same place.
 - 1.6.10 and 1.6.11 gave new copies an id from the hash of their key and kept none of the ids earlier builds gave. The first build after them puts those rows back once: each takes the id the newest game session log from before 1.6.10 (`$DATA/sessions/<stamp>/loader.log`) shows for its label, and a row no log shows takes the next free id in load order again. An addon whose hashed team ids a session loaded since 1.6.10, while none loaded its earlier ones, keeps the hashed ids.
 - The file keeps every id a row had before the one it keeps (the ids 1.6.10 and 1.6.11 hashed, the ids a row moved from). Each build writes them to `swofty/id_aliases.json` as `{ "version": 1, "tables": { "teams": { "646": 518 }, "vehicles": {}, "drivers": {} } }`, earlier id to current id. When a Grand Prix is continued and no entrant list holds the saved entrants' teams, the core maps the saved entrants' team, vehicle and driver ids through it and loads the list that holds the mapped teams, so a Grand Prix started on 1.6.10 or 1.6.11 loads on a later build.
 - A table with no free id left takes the lowest id kept for an addon the build leaves out.
@@ -289,12 +289,13 @@ The game keeps the id of some tables in one byte, and of game setup modes and se
 | `entrants.animation.driver_animation_sets.driver_animation_set_N` | 254 |
 | `entrants.entrant_lists.entrant_list_N` | 255 |
 | `entrants.nationality.nationality_N` | 255 |
+| `leaderboards.leaderboard_descriptor_N` | 255 |
 | `game_setup.scenarios.scenario_N` (`statId`) | 254 |
 | `game_setup.game_setup_modes.game_setup_mode_N` | 31 |
 | `game_setup.seasons.season_N` (`statId`) | 31 |
 | `entrants.entrant_setup_modes.entrant_setup_mode_N` | 31 |
 
-A game setup mode or season id above 31 stops the game at boot. A driver id is 16 bits in memory and 14 in saves and net messages, so 16382 is the highest; a copy takes 208 to 253 first, then 256 upward.
+A leaderboard descriptor's id is the byte that names the Time Trial board (`LBV<id><track><D|W>`) and splits the cars and times of the lists that point at it ([Leaderboards](/std/content#leaderboards)). A game setup mode or season id above 31 stops the game at boot. A driver id is 16 bits in memory and 14 in saves and net messages, so 16382 is the highest; a copy takes 208 to 253 first, then 256 upward.
 
 When the next id above the table's highest would pass it, the copy gets the lowest id above the stock rows' highest that no row holds, and a driver the lowest free id from 208. The build prints it:
 

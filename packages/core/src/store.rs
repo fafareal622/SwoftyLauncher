@@ -51,6 +51,47 @@ fn not_done(what: &str, e: &std::io::Error) -> Error {
     })
 }
 
+fn swap_lock_path(addons: &Path, id: &str) -> PathBuf {
+    addons.join(format!(".swap-{id}.lock"))
+}
+
+/// Held while one process swaps an addon folder, so another launcher's
+/// start-up cleanup leaves the half-finished swap alone. The operating system
+/// drops it when the process ends, which is how a later start tells a dead
+/// swap from a live one. Where the file system cannot lock, swaps go unguarded.
+struct SwapLock {
+    _file: std::fs::File,
+}
+
+impl SwapLock {
+    fn try_acquire(addons: &Path, id: &str) -> Option<Option<Self>> {
+        let path = swap_lock_path(addons, id);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .ok()?;
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => Some(None),
+            Ok(()) | Err(std::fs::TryLockError::Error(_)) => Some(Some(Self { _file: file })),
+        }
+    }
+}
+
+fn swap_lock_for(dest: &Path, name: &str) -> Result<Option<SwapLock>> {
+    let (Some(addons), Some(id)) = (dest.parent(), dest.file_name()) else {
+        return Ok(None);
+    };
+    match SwapLock::try_acquire(addons, &id.to_string_lossy()) {
+        Some(None) => Err(Error::Other(format!(
+            "Couldn't change {name}: another Swofty launcher is changing it right now"
+        ))),
+        Some(Some(lock)) => Ok(Some(lock)),
+        None => Ok(None),
+    }
+}
+
 /// Moves `dir` to a hidden `.old-` folder beside it. A file still in use stops
 /// the move, and then nothing in `dir` has changed.
 fn set_aside(dir: &Path, rename: Rename) -> std::io::Result<PathBuf> {
@@ -74,6 +115,7 @@ fn set_aside(dir: &Path, rename: Rename) -> std::io::Result<PathBuf> {
 fn swap_in(staging: &Path, dest: &Path, name: &str, rename: Rename, delete: Delete) -> Result<()> {
     let verb = if dest.exists() { "update" } else { "install" };
     let what = format!("Couldn't {verb} {name}");
+    let _lock = swap_lock_for(dest, name)?;
     let aside = match dest.exists().then(|| set_aside(dest, &mut *rename)).transpose() {
         Ok(aside) => aside,
         Err(e) => {
@@ -100,6 +142,7 @@ fn swap_in(staging: &Path, dest: &Path, name: &str, rename: Rename, delete: Dele
 /// a file still in use stops the removal before anything is deleted. An old
 /// copy that can't be deleted yet is deleted on the next start.
 fn delete_addon_dir(dir: &Path, name: &str, rename: Rename, delete: Delete) -> Result<()> {
+    let _lock = swap_lock_for(dir, name)?;
     let aside = set_aside(dir, rename).map_err(|e| not_done(&format!("Couldn't remove {name}"), &e))?;
     waiting_out_locks(|| delete(&aside)).ok();
     Ok(())
@@ -179,7 +222,7 @@ impl Store {
     }
 
     pub fn overlays_dir(&self, profile: &str) -> PathBuf {
-        self.root.join("cache/overlay").join(profile)
+        overlay_root(&self.root).join(profile)
     }
 
     pub fn overlay_dir(&self, profile: &str, buildhash: &str) -> PathBuf {
@@ -220,6 +263,13 @@ impl Store {
 
     pub fn migrate(&self) -> Result<Vec<String>> {
         let mut notes = Vec::new();
+        if let Some(target) = crate::paths::dangling_link(&self.root) {
+            return Err(Error::Other(format!(
+                "the data folder {} links to {}, which is missing. Reconnect that drive or restore the folder; the launcher will not start a new data folder in its place",
+                self.root.display(),
+                target.display()
+            )));
+        }
         if !self.root.is_dir() {
             return Ok(notes);
         }
@@ -296,6 +346,34 @@ impl Store {
         old.sort();
         let mut notes = Vec::new();
         for dir in old {
+            let stem = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().trim_start_matches(OLD_PREFIX).to_owned())
+                .unwrap_or_default();
+            let base = match stem.rsplit_once('-') {
+                Some((b, n)) if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) => b.to_owned(),
+                _ => stem.clone(),
+            };
+            let mut names = vec![stem, base];
+            names.extend(manifest_id(&dir));
+            names.sort();
+            names.dedup();
+            let mut guards = Vec::new();
+            let mut busy = false;
+            for n in &names {
+                match SwapLock::try_acquire(&addons, n) {
+                    Some(None) => busy = true,
+                    Some(Some(g)) => guards.push(g),
+                    None => {}
+                }
+            }
+            if busy {
+                notes.push(format!(
+                    "left {} alone: another launcher is changing it",
+                    dir.display()
+                ));
+                continue;
+            }
             let interrupted = manifest_id(&dir).filter(|id| {
                 !addons.join(id).exists() && addons.join(format!("{STAGING_PREFIX}{id}")).is_dir()
             });
@@ -419,6 +497,7 @@ impl Store {
         if src.join(crate::dbedit::package::MARKER).is_file() {
             return crate::dbedit::package::install(self, src).map(|(p, _)| {
                 std::fs::remove_file(self.registry_install_path(&p.manifest.id)).ok();
+                self.add_to_active_profile(&p.manifest.id);
                 p.manifest
             });
         }
@@ -451,6 +530,7 @@ impl Store {
         }
         crate::busy::refuse_change(&self.root, &m.id, &m.name)?;
         let dest = self.addons_dir().join(&m.id);
+        let fresh = !dest.exists();
         self.helpers.forget(&m.id);
         let staging = self.addons_dir().join(format!("{STAGING_PREFIX}{}", m.id));
         if staging.exists() {
@@ -469,7 +549,23 @@ impl Store {
             &mut |d| std::fs::remove_dir_all(d),
         )?;
         std::fs::remove_file(self.registry_install_path(&m.id)).ok();
+        if fresh {
+            self.add_to_active_profile(&m.id);
+        }
         Ok(m)
+    }
+
+    /// A new addon goes into the profile it was installed from, off, rather than
+    /// every profile; the others add it from their own Addons page. A failure
+    /// only leaves it out of the profile, so it doesn't fail the install.
+    fn add_to_active_profile(&self, id: &str) {
+        let name = self.active_profile();
+        if name == profile::VANILLA {
+            return;
+        }
+        if let Err(e) = self.update_profile(&name, |p| p.add_addon(id)) {
+            eprintln!("couldn't add {id} to the {name} profile: {e}");
+        }
     }
 
     fn in_scratch(&self, path: &Path) -> bool {
@@ -999,6 +1095,10 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn overlay_root(root: &std::path::Path) -> PathBuf {
+    root.join("cache").join("overlay")
 }
 
 #[cfg(test)]
@@ -1862,6 +1962,44 @@ mod tests {
         .unwrap();
         std::fs::write(staging.join("base/common.erp"), b"v2").unwrap();
         (root, store, dest, staging)
+    }
+
+    #[test]
+    fn finish_swaps_leaves_a_swap_another_process_is_making() {
+        let (root, store, dest, staging) = installed_with_update("swap-live");
+        let aside = store.addons_dir().join(format!("{OLD_PREFIX}a.livery"));
+        std::fs::rename(&dest, &aside).unwrap();
+        let lock = SwapLock::try_acquire(&store.addons_dir(), "a.livery")
+            .unwrap()
+            .unwrap();
+        let notes = store.finish_swaps();
+        assert!(aside.is_dir() && staging.is_dir() && !dest.exists());
+        assert!(notes.iter().any(|n| n.contains("another launcher")));
+        drop(lock);
+        let notes = store.finish_swaps();
+        assert!(dest.is_dir() && !aside.exists() && !staging.exists());
+        assert!(notes.iter().any(|n| n.contains("put back a.livery")));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_swap_waits_out_nothing_when_another_process_holds_the_same_addon() {
+        let (root, store, dest, staging) = installed_with_update("swap-contended");
+        let lock = SwapLock::try_acquire(&store.addons_dir(), "a.livery")
+            .unwrap()
+            .unwrap();
+        let e = swap_in(
+            &staging,
+            &dest,
+            "A",
+            &mut |from, to| std::fs::rename(from, to),
+            &mut |d| std::fs::remove_dir_all(d),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("another Swofty launcher"));
+        assert_eq!(std::fs::read(dest.join("base/common.erp")).unwrap(), b"v1");
+        drop(lock);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

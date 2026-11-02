@@ -15,11 +15,16 @@
 #include "dred.hpp"
 #include "dred_logic.hpp"
 #include "fast_fail_logic.hpp"
+#include "hw_settings_logic.hpp"
 #include "json.hpp"
 #include "perf.hpp"
 #include "save_heap_logic.hpp"
 #include "safetyhook.hpp"
 #include "swofty_api.h"
+
+namespace runtime {
+void placed_record_crash_text(char *out, size_t cap);
+}
 
 std::string core_code_owner(uintptr_t addr);
 
@@ -252,6 +257,49 @@ void cl(const char *f, ...)
     va_end(ap);
     api->log("%s", b);
     diag_line(b);
+}
+
+/* One loader.log line about the player's hardware_settings_config.xml, written at attach before the game's
+   InitSequence reads it: its Documents path, whether that is under OneDrive, its size and attributes, and a read
+   test that opens without recalling a cloud-only file and does not read one at all. */
+void log_hardware_settings()
+{
+    hw_settings::Probe p;
+    wchar_t docs[MAX_PATH] = {};
+    using GetFolder = HRESULT(WINAPI *)(HWND, int, HANDLE, DWORD, LPWSTR);
+    HMODULE shell = GetModuleHandleW(L"shell32.dll");
+    if (!shell)
+        shell = LoadLibraryW(L"shell32.dll");
+    auto get = shell ? reinterpret_cast<GetFolder>(GetProcAddress(shell, "SHGetFolderPathW")) : nullptr;
+    if (get && SUCCEEDED(get(nullptr, 0x0005, nullptr, 0, docs))) {
+        std::wstring path = std::wstring(docs) + L"\\My Games\\F1 25\\hardwaresettings\\hardware_settings_config.xml";
+        char utf8[1024] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, utf8, sizeof utf8 - 1, nullptr, nullptr);
+        p.path = utf8;
+        p.onedrive = hw_settings::under_onedrive(path);
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
+            p.exists = true;
+            p.attrs = fa.dwFileAttributes;
+            p.size = (uint64_t(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+            if (!hw_settings::cloud_only(p.attrs)) {
+                p.read_tried = true;
+                HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | 0x00100000, nullptr);
+                char buf[4096];
+                DWORD n = 0;
+                if (h != INVALID_HANDLE_VALUE && ReadFile(h, buf, sizeof buf, &n, nullptr)) {
+                    p.read_ok = true;
+                    p.read_bytes = n;
+                } else {
+                    p.read_error = GetLastError();
+                }
+                if (h != INVALID_HANDLE_VALUE)
+                    CloseHandle(h);
+            }
+        }
+    }
+    api->log("%s", hw_settings::line(p).c_str());
 }
 
 /* Every api->log call from core and the addons passes through here on its way to the loader, so the
@@ -897,6 +945,20 @@ void on_heap_error(int code, const char *msg, bool is_fatal, void *heap)
                      (unsigned long long)h.used, (unsigned long long)h.free_bytes, (unsigned long long)h.largest)
                      .c_str()
                : "");
+    if (code == 0x58) {
+        DWORD last = GetLastError();
+        MEMORYSTATUSEX ms = {};
+        ms.dwLength = sizeof ms;
+        if (GlobalMemoryStatusEx(&ms))
+            cl("[crash] Ne heap error 0x58 (useAddressSpace: the commit of a heap block failed, error 0x58 is a Win32 error the game does not map, e.g. 1455 commit limit) in '%s': last Win32 error %lu, system commit limit %llu MiB, commit left %llu MiB, physical %llu of %llu MiB free, process address space left %llu MiB; heap %s",
+               h.name, last, (unsigned long long)(ms.ullTotalPageFile >> 20), (unsigned long long)(ms.ullAvailPageFile >> 20),
+               (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
+               (unsigned long long)(ms.ullAvailVirtual >> 20),
+               h.stats ? fmt("capacity %llu, used %llu, free %llu, largest free %llu", (unsigned long long)h.capacity,
+                             (unsigned long long)h.used, (unsigned long long)h.free_bytes, (unsigned long long)h.largest)
+                             .c_str()
+                       : "stats unavailable");
+    }
     if (!is_fatal)
         return;
     alignas(16) CONTEXT ctx;
@@ -1371,6 +1433,9 @@ void section_state(const Request &r)
             out.put("  last %-9s none recorded\n", k);
     }
     out.put("  track and car count: core does not read them\n");
+    char placed[256];
+    runtime::placed_record_crash_text(placed, sizeof placed);
+    out.put("  %s\n", placed);
 }
 
 void section_blackbox(const Request &r)
@@ -2200,4 +2265,5 @@ void crash_attach(SwoftyApi *a, const std::wstring &dir)
     cl("[crash] RaiseFailFastException %s; the CRT's fast-fail paths are hooked once the game's code is decrypted",
        fail_fast_hooked ? "hooked" : "NOT hooked");
     runtime::dred::arm(swofty_dir, tap, self);
+    log_hardware_settings();
 }

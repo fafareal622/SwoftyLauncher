@@ -1368,6 +1368,382 @@ static void crash_weekends(void)
     fflush(stdout);
 }
 
+// The three unchecked loads of Career_TeamHqAdvance_BuildTrackNode, with the bytes around them copied from the Steam build
+// (0x1419b44e5..0x1419b44f6, 0x1419b4788..0x1419b4799, 0x1419b47a6..0x1419b47b6), in a small frame taking the track record
+// (rbx) in rcx, the TrackDataTrack (r14) in rdx, the calendar event (rdi, track byte at +0x18) in r8 and a three-slot
+// result in r9. The empty node handle (r13) is 0xe3e7; the result holds rdx after each record read and rcx after the track
+// read, the game's own fallback for an empty node. Core's Team HQ track guard finds the three loads by their byte
+// patterns: the record handle read at +0x1d, the second record read at +0x37 and the track read at +0x52.
+__asm__(
+    ".section .xtls,\"xr\"\n"
+    ".globl fake_teamhq_node\n"
+    ".def fake_teamhq_node; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_teamhq_node\n"
+    "fake_teamhq_node:\n"
+    ".byte 0x53\n.seh_pushreg %rbx\n"
+    ".byte 0x57\n.seh_pushreg %rdi\n"
+    ".byte 0x41,0x55\n.seh_pushreg %r13\n"
+    ".byte 0x41,0x56\n.seh_pushreg %r14\n"
+    ".seh_endprologue\n"
+    ".byte 0x48,0x89,0xCB,0x49,0x89,0xD6,0x4C,0x89,0xC7,0x41,0xBD,0xE7,0xE3,0x00,0x00\n"
+    ".byte 0x48,0x85,0xDB,0x75,0x03\n"
+    ".byte 0x45,0x31,0xF6\n"
+    ".byte 0x48,0x8B,0x83,0xC0,0x02,0x00,0x00,0x48,0x8D,0x50,0x08,0x48,0x85,0xC0,0x49,0x0F,0x44,0xD5\n"
+    ".byte 0x49,0x89,0x11\n"
+    "call fake_teamhq_stub\n"
+    ".byte 0x48,0x8B,0x83,0xC0,0x02,0x00,0x00,0x48,0x8D,0x50,0x08,0x48,0x85,0xC0,0x49,0x0F,0x44,0xD5\n"
+    ".byte 0x49,0x89,0x51,0x08\n"
+    "call fake_teamhq_stub\n"
+    ".byte 0x49,0x8B,0x46,0x30,0x48,0x8D,0x48,0x08,0x48,0x85,0xC0,0x49,0x0F,0x44,0xCD\n"
+    ".byte 0x49,0x89,0x49,0x10\n"
+    ".byte 0x41,0x5E,0x41,0x5D,0x5F,0x5B,0xC3\n"
+    ".seh_endproc\n"
+    "fake_teamhq_stub:\n"
+    ".byte 0xC3\n"
+    ".section .drectve\n"
+    ".ascii \" -export:fake_teamhq_node\"\n"
+    ".text\n");
+void fake_teamhq_node(void *record, void *track, void *event, uint64_t *out);
+
+static uint8_t teamhq_record[0x2c8], teamhq_track[0x40], teamhq_event[0x20];
+
+static void teamhq_setup(uint8_t track_id)
+{
+    memset(teamhq_record, 0, sizeof teamhq_record);
+    memset(teamhq_track, 0, sizeof teamhq_track);
+    teamhq_record[1] = track_id;
+    *(uint64_t *)(teamhq_record + 0x2c0) = 0x2c0c0de;
+    *(uint64_t *)(teamhq_track + 0x30) = 0x7ac0de;
+    teamhq_event[0x18] = track_id;
+}
+
+static void test_teamhq(void)
+{
+    uint64_t out[3] = {0, 0, 0};
+    teamhq_setup(9);
+    fake_teamhq_node(teamhq_record, teamhq_track, teamhq_event, out);
+    expect(out[0] == 0x2c0c0de + 8 && out[1] == 0x2c0c0de + 8 && out[2] == 0x7ac0de + 8,
+           "teamhq: an event with a record and a track reads both as the game does");
+    teamhq_setup(6);
+    fake_teamhq_node(teamhq_record, NULL, teamhq_event, out);
+    expect(out[0] == 0x2c0c0de + 8 && out[2] == 0xe3e7, "teamhq: an event whose track has no track data takes the empty node handle");
+    fake_teamhq_node(teamhq_record, NULL, teamhq_event, out);
+    teamhq_setup(1);
+    fake_teamhq_node(NULL, NULL, teamhq_event, out);
+    expect(out[0] == 0xe3e7 && out[1] == 0xe3e7 && out[2] == 0xe3e7, "teamhq: an event whose track has no record takes the empty node handle");
+}
+
+static void crash_teamhq(void)
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    uint64_t out[3] = {0, 0, 0};
+    teamhq_setup(6);
+    printf("      teamhq: reading an event whose track has no track data\n");
+    fflush(stdout);
+    fake_teamhq_node(teamhq_record, NULL, teamhq_event, out);
+    printf("      teamhq: the event returned %llx\n", (unsigned long long)out[2]);
+    fflush(stdout);
+}
+
+// The race length text body of the career activity report (Steam .data1 0x151948840: virtual +0x80 and +0x10 of the ui
+// variable table at championship +0x1030, then three u32 reads through 0x140bc9ef0 at +0x64, +0x76 and +0x7d), with the
+// instructions around the reads copied from the Steam build, in a frame taking the championship in rcx. Core's activity
+// resume guard finds the two reads and the epilogue (lea rsi ; mov rax,rsi ; add rsp,0x20) by byte patterns in .data1.
+__asm__(
+    ".section .data1,\"dwx\"\n"
+    ".globl fake_activity_length\n"
+    ".def fake_activity_length; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_activity_length\n"
+    "fake_activity_length:\n"
+    ".byte 0x41,0x56\n.seh_pushreg %r14\n"
+    ".byte 0x56\n.seh_pushreg %rsi\n"
+    ".byte 0x57\n.seh_pushreg %rdi\n"
+    ".byte 0x55\n.seh_pushreg %rbp\n"
+    ".byte 0x53\n.seh_pushreg %rbx\n"
+    ".byte 0x48,0x83,0xEC,0x20\n.seh_stackalloc 0x20\n"
+    ".seh_endprologue\n"
+    ".byte 0x48,0x89,0xCF\n"
+    ".byte 0x48,0x8B,0x81,0x30,0x10,0x00,0x00\n"
+    ".byte 0x48,0x81,0xC7,0x30,0x10,0x00,0x00\n"
+    ".byte 0x48,0x89,0xF9\n"
+    ".byte 0xFF,0x90,0x80,0x00,0x00,0x00\n"
+    ".byte 0x48,0x8D,0x35\n.long fake_activity_full-(.+4)\n"
+    ".byte 0x48,0x85,0xC0\n"
+    "je 2f\n"
+    ".byte 0x48,0x8B,0x98,0x90,0x02,0x00,0x00\n"
+    ".byte 0x48,0x2B,0x98,0x88,0x02,0x00,0x00\n"
+    ".byte 0x48,0xC1,0xEB,0x03\n"
+    ".byte 0x48,0x8B,0x07\n"
+    ".byte 0x48,0x8D,0x15\n.long fake_activity_full-(.+4)\n"
+    ".byte 0x48,0x89,0xF9\n"
+    ".byte 0x41,0xB8,0x01,0x00,0x00,0x00\n"
+    ".byte 0xFF,0x50,0x10\n"
+    ".byte 0x48,0x89,0xC7\n"
+    ".byte 0x48,0x89,0xC1\n"
+    ".byte 0xB2,0x02\n"
+    ".byte 0xE8\n.long fake_activity_get-(.+4)\n"
+    ".byte 0x44,0x8B,0x30\n"
+    ".byte 0x48,0x89,0xF9\n"
+    ".byte 0xB2,0x01\n"
+    ".byte 0xE8\n.long fake_activity_get-(.+4)\n"
+    ".byte 0x8B,0x28\n"
+    ".byte 0x48,0x89,0xF9\n"
+    ".byte 0x31,0xD2\n"
+    ".byte 0xE8\n.long fake_activity_get-(.+4)\n"
+    ".byte 0x41,0x39,0xDE\n"
+    "jae 3f\n"
+    ".byte 0x39,0xDD\n"
+    "jae 4f\n"
+    "jmp 2f\n"
+    "3:\n"
+    ".byte 0x48,0x8D,0x35\n.long fake_activity_short-(.+4)\n"
+    "jmp 2f\n"
+    "4:\n"
+    ".byte 0x48,0x8D,0x35\n.long fake_activity_medium-(.+4)\n"
+    "2:\n"
+    ".byte 0x48,0x89,0xF0\n"
+    ".byte 0x48,0x83,0xC4,0x20\n"
+    ".byte 0x5B,0x5D,0x5F,0x5E,0x41,0x5E,0xC3\n"
+    ".seh_endproc\n"
+    ".text\n");
+const char *fake_activity_length(void *championship);
+
+const char fake_activity_full[] = "full", fake_activity_short[] = "short", fake_activity_medium[] = "medium";
+
+static uint8_t activity_tracklist[0x298];
+static uint64_t activity_vt[0x20];
+static uint32_t activity_fields[3];
+static int activity_has_group;
+
+__attribute__((ms_abi)) void *fake_activity_get(void *group, uint8_t index)
+{
+    (void)group;
+    return activity_has_group ? (void *)&activity_fields[index] : NULL;
+}
+
+__attribute__((ms_abi)) static void *activity_tracklist_of(void *table)
+{
+    (void)table;
+    return activity_tracklist;
+}
+
+__attribute__((ms_abi)) static void *activity_group_of(void *table, const char *name, int mode)
+{
+    (void)name;
+    (void)mode;
+    return table;
+}
+
+static uint8_t activity_championship[0x1040];
+
+static const char *activity_run(int group, uint32_t length_field, uint32_t kind_field, uint32_t count)
+{
+    activity_has_group = group;
+    activity_fields[2] = length_field;
+    activity_fields[1] = kind_field;
+    *(uint64_t *)(activity_tracklist + 0x288) = 0x1000;
+    *(uint64_t *)(activity_tracklist + 0x290) = 0x1000 + 8ull * count;
+    activity_vt[0x10 / 8] = (uint64_t)(uintptr_t)activity_group_of;
+    activity_vt[0x80 / 8] = (uint64_t)(uintptr_t)activity_tracklist_of;
+    *(uint64_t *)(activity_championship + 0x1030) = (uint64_t)(uintptr_t)activity_vt;
+    return fake_activity_length(activity_championship);
+}
+
+static void test_activity(void)
+{
+    expect(!strcmp(activity_run(1, 1, 1, 4), "full"), "activity: a championship with its fields reads them as the game does");
+    expect(!strcmp(activity_run(1, 9, 1, 4), "short") && !strcmp(activity_run(1, 1, 9, 4), "medium"),
+           "activity: the fields past the track list give the short and medium texts");
+    expect(!strcmp(activity_run(0, 0, 0, 4), "full"), "activity: a championship whose group is missing keeps the default text");
+    activity_run(0, 0, 0, 4);
+}
+
+static void crash_activity(void)
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    printf("      activity: reading a championship whose track is not in the track list\n");
+    fflush(stdout);
+    const char *text = activity_run(0, 0, 0, 4);
+    printf("      activity: the report returned %s\n", text);
+    fflush(stdout);
+}
+
+// The tail of the car setup screen handler Game_CarSetupVm_Initialise (0x140c1b904..0x140c1b945), copied byte for byte
+// from the Steam build in a small frame taking the vm in rcx: the setup data test (mov rax,[vm+0x268] ; je), the car load
+// (mov rax,[rax+0x28]) and the handling version compare with its jne at +0x18, then the two differential range updates,
+// here fake_setup_diff_a and fake_setup_diff_b counting their calls, and the game's following mov dword [rsp+0x30],4. Core's
+// setup screen car guard finds the compare by its byte pattern.
+__asm__(
+    ".section .xtls,\"xr\"\n"
+    ".globl fake_setup_vm\n"
+    ".def fake_setup_vm; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_setup_vm\n"
+    "fake_setup_vm:\n"
+    ".byte 0x56\n.seh_pushreg %rsi\n"
+    ".byte 0x48,0x83,0xEC,0x40\n.seh_stackalloc 0x40\n"
+    ".seh_endprologue\n"
+    ".byte 0x48,0x89,0xCE\n"
+    ".byte 0x48,0x8B,0x86,0x68,0x02,0x00,0x00\n"
+    ".byte 0x48,0x85,0xC0\n"
+    ".byte 0x74,0x1D\n"
+    ".byte 0x48,0x8B,0x40,0x28\n"
+    ".byte 0x83,0xB8,0x40,0x9F,0x00,0x00,0x64\n"
+    ".byte 0x75,0x10\n"
+    ".byte 0x48,0x89,0xF1\n"
+    "call fake_setup_diff_a\n"
+    ".byte 0x48,0x89,0xF1\n"
+    "call fake_setup_diff_b\n"
+    ".byte 0xC7,0x44,0x24,0x30,0x04,0x00,0x00,0x00\n"
+    ".byte 0x48,0x83,0xC4,0x40\n"
+    ".byte 0x5E,0xC3\n"
+    ".seh_endproc\n"
+    ".section .drectve\n"
+    ".ascii \" -export:fake_setup_vm\"\n"
+    ".text\n");
+void fake_setup_vm(void *vm);
+
+static int setup_diff_calls;
+void fake_setup_diff_a(void) { setup_diff_calls++; }
+void fake_setup_diff_b(void) { setup_diff_calls += 10; }
+
+static uint8_t setup_vm_mem[0x300], setup_data[0x40], setup_car[0x9f60];
+
+static void setup_vm_prepare(int has_data, int has_car, uint32_t version)
+{
+    memset(setup_vm_mem, 0, sizeof setup_vm_mem);
+    memset(setup_data, 0, sizeof setup_data);
+    memset(setup_car, 0, sizeof setup_car);
+    *(uint32_t *)(setup_car + 0x9f40) = version;
+    *(void **)(setup_data + 0x28) = has_car ? (void *)setup_car : NULL;
+    *(void **)(setup_vm_mem + 0x268) = has_data ? (void *)setup_data : NULL;
+    setup_diff_calls = 0;
+}
+
+static void test_setup_vm(void)
+{
+    setup_vm_prepare(1, 1, 100);
+    fake_setup_vm(setup_vm_mem);
+    expect(setup_diff_calls == 11, "setups: a setup screen with a version 100 car updates both differential ranges");
+    setup_vm_prepare(1, 1, 90);
+    fake_setup_vm(setup_vm_mem);
+    expect(setup_diff_calls == 0, "setups: a setup screen with an older car updates neither range");
+    setup_vm_prepare(0, 0, 0);
+    fake_setup_vm(setup_vm_mem);
+    expect(setup_diff_calls == 0, "setups: a setup screen with no setup data updates neither range");
+}
+
+static void crash_setup_vm(void)
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    setup_vm_prepare(1, 0, 0);
+    printf("      setups: refreshing a setup screen whose setup data has no car\n");
+    fflush(stdout);
+    fake_setup_vm(setup_vm_mem);
+    printf("      setups: the refresh returned with %d range updates\n", setup_diff_calls);
+    fflush(stdout);
+}
+
+// The pairing step of Sess_Strategy_UpdateTeammatePairs, with the bytes of the size test and the equal-flag test copied
+// from the Steam build (0x1436abc9e..0x1436abcf9) in a small frame taking the vector of a team's car records in
+// rcx (begin) and rdx (end), a pointer to the team entry in r8 and the session in r9. The sort 0x1436b36f0 is
+// fake_pairs_sort: it orders the vector by the byte at +0x80 and faults when a record's byte at +0x81 is 0, where the
+// game throws through Ne_Std_ThrowException. Core's teammate pairs guard finds the size test by its byte pattern (+0x2e).
+__asm__(
+    ".section .xtls,\"xr\"\n"
+    ".globl fake_teammate_pairs\n"
+    ".def fake_teammate_pairs; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_teammate_pairs\n"
+    "fake_teammate_pairs:\n"
+    ".byte 0x53\n.seh_pushreg %rbx\n"
+    ".byte 0x56\n.seh_pushreg %rsi\n"
+    ".byte 0x41,0x54\n.seh_pushreg %r12\n"
+    ".byte 0x41,0x55\n.seh_pushreg %r13\n"
+    ".byte 0x55\n.seh_pushreg %rbp\n"
+    ".byte 0x41,0x56\n.seh_pushreg %r14\n"
+    ".byte 0x48,0x83,0xEC,0x28\n.seh_stackalloc 0x28\n"
+    ".seh_endprologue\n"
+    ".byte 0x49,0x89,0xCC,0x48,0x89,0xD5,0x4D,0x89,0xC6,0x4C,0x89,0xCE\n"
+    ".byte 0x49,0x89,0xED,0x4D,0x29,0xE5\n"
+    ".byte 0x49,0x83,0xFD,0x10\n"
+    ".byte 0x0F,0x82\n.long fake_tp_done - . - 4\n"
+    ".byte 0x49,0x8B,0x04,0x24,0x49,0x8B,0x54,0x24,0x08,0x0F,0xB6,0x88,0x81,0x00,0x00,0x00\n"
+    ".byte 0x84,0xC9,0x41,0x0F,0x95,0xC0,0x0F,0xB6,0x82,0x81,0x00,0x00,0x00,0x84,0xC0,0x0F,0x95,0xC2,0x44,0x30,0xC2\n"
+    ".byte 0x0F,0x85\n.long fake_tp_done - . - 4\n"
+    ".byte 0x49,0xC1,0xFD,0x03\n"
+    ".byte 0x84,0xC9\n.byte 0x74\n.byte fake_tp_done - . - 1\n"
+    ".byte 0x84,0xC0\n.byte 0x74\n.byte fake_tp_done - . - 1\n"
+    ".byte 0x4C,0x89,0xE1,0x48,0x89,0xEA,0x4D,0x89,0xE8\n"
+    "call fake_pairs_sort\n"
+    "fake_tp_done:\n"
+    ".byte 0x48,0x83,0xC4,0x28\n"
+    ".byte 0x41,0x5E,0x5D,0x41,0x5D,0x41,0x5C,0x5E,0x5B,0xC3\n"
+    ".seh_endproc\n"
+    ".section .drectve\n"
+    ".ascii \" -export:fake_teammate_pairs -export:fake_pairs_sort\"\n"
+    ".text\n");
+void fake_teammate_pairs(void *begin, void *end, void *team_entry, void *session);
+
+static volatile uintptr_t pairs_null;
+
+__attribute__((noinline)) void fake_pairs_sort(uint8_t **begin, uint8_t **end, uint64_t count)
+{
+    for (uint8_t **p = begin; p < end; p++)
+        if (!(*p)[0x81])
+            *(volatile int *)pairs_null = (int)count;
+    for (uint8_t **a = begin; a < end; a++)
+        for (uint8_t **b = a + 1; b < end; b++)
+            if ((*b)[0x80] < (*a)[0x80]) {
+                uint8_t *t = *a;
+                *a = *b;
+                *b = t;
+            }
+}
+
+static uint8_t pairs_cars[3][0x90], pairs_team[0x30], *pairs_team_ptr = pairs_team, pairs_session[8];
+
+static void pairs_setup(uint8_t third_valid)
+{
+    memset(pairs_cars, 0, sizeof pairs_cars);
+    memset(pairs_team, 0, sizeof pairs_team);
+    *(uint32_t *)(pairs_team + 0x28) = 6;
+    pairs_cars[0][0x80] = 5;
+    pairs_cars[0][0x81] = 1;
+    pairs_cars[1][0x80] = 2;
+    pairs_cars[1][0x81] = 1;
+    pairs_cars[2][0x80] = 9;
+    pairs_cars[2][0x81] = third_valid;
+}
+
+static void test_teammate_pairs(void)
+{
+    uint8_t *v[3] = {pairs_cars[0], pairs_cars[1], pairs_cars[2]};
+    pairs_setup(0);
+    fake_teammate_pairs(v, v + 2, &pairs_team_ptr, pairs_session);
+    expect(v[0] == pairs_cars[1] && v[1] == pairs_cars[0],
+           "pairs: a team with two cars is sorted as the game does");
+    uint8_t *w[3] = {pairs_cars[0], pairs_cars[1], pairs_cars[2]};
+    fake_teammate_pairs(w, w + 3, &pairs_team_ptr, pairs_session);
+    expect(w[0] == pairs_cars[1] && w[1] == pairs_cars[0] && w[2] == pairs_cars[2],
+           "pairs: a team with a third car pairs its first two and leaves the third unpaired");
+    uint8_t *x[3] = {pairs_cars[0], pairs_cars[1], pairs_cars[2]};
+    pairs_setup(1);
+    fake_teammate_pairs(x, x + 3, &pairs_team_ptr, pairs_session);
+    expect(x[0] == pairs_cars[1] && x[1] == pairs_cars[0] && x[2] == pairs_cars[2],
+           "pairs: a third car with a valid record is left unpaired too");
+}
+
+static void crash_pairs(void)
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    uint8_t *v[3] = {pairs_cars[0], pairs_cars[1], pairs_cars[2]};
+    pairs_setup(0);
+    printf("      pairs: sorting a team with three cars\n");
+    fflush(stdout);
+    fake_teammate_pairs(v, v + 3, &pairs_team_ptr, pairs_session);
+    printf("      pairs: the team was paired\n");
+    fflush(stdout);
+}
+
 // The two entrant-list lookups behind the front-end tile populate, copied byte for byte from the Steam build in small
 // frames, the calls and the RIP-relative operands pointed at stand-ins. fake_list_first_id is
 // FeTile_Get_ListFirstEntrantId (0x141738eb0..0x141738f6c) taking the item in rcx and the result in rdx: it scans the
@@ -1635,6 +2011,169 @@ static void crash_ai_corner(void)
     fflush(stdout);
     uint64_t r = fake_ai_corner(ai_corner_result, 3, ai_corner_state);
     printf("      ai corner: the car returned 0x%llx\n", (unsigned long long)r);
+    fflush(stdout);
+}
+
+// Ne_Replay_WriteFrames' stream and holder state around site_Ne_ReplayAfterRecord (the call [rax+0x20], mov r12,rsi,
+// mov rax,[rsi], mov rcx,rsi bytes of the Steam build at 0x1445d170f), in a small frame that takes the scratch buffer in rcx,
+// the serialized state's size in rdx, the holder's capacity in r8 and the recordable's name in r9. It lays them out where the
+// game keeps them (stream position [rsp+0x98], stream base [rsp+0xa0], holder capacity [rsp+0x108], name in r13) and returns
+// the size the recorder would copy into the holder: position minus base after the site. Core's replay recorder grid guard
+// cuts a state larger than the capacity to nothing there.
+__asm__(
+    ".section .xtls,\"xr\"\n"
+    ".globl fake_replay_write\n"
+    ".def fake_replay_write; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_replay_write\n"
+    "fake_replay_write:\n"
+    "push %rsi\n.seh_pushreg %rsi\n"
+    "push %r12\n.seh_pushreg %r12\n"
+    "push %r13\n.seh_pushreg %r13\n"
+    "sub $0x120,%rsp\n.seh_stackalloc 0x120\n"
+    ".seh_endprologue\n"
+    "mov %r9,%r13\n"
+    "mov 0x160(%rsp),%rax\n"
+    "mov %rax,0x198(%rsp)\n"
+    "movq $0,0x190(%rsp)\n"
+    "movq $0,0x118(%rsp)\n"
+    "mov %rcx,0xa0(%rsp)\n"
+    "lea (%rcx,%rdx),%rax\n"
+    "mov %rax,0x98(%rsp)\n"
+    "mov %r8,0x108(%rsp)\n"
+    "lea .Lrwstub(%rip),%rax\n"
+    "mov %rax,0x60(%rsp)\n"
+    "lea 0x40(%rsp),%rax\n"
+    "lea 0x10(%rsp),%rsi\n"
+    ".byte 0xFF,0x50,0x20,0x49,0x89,0xF4,0x48,0x8B,0x06,0x48,0x89,0xF1\n"
+    "mov 0x98(%rsp),%rax\n"
+    "sub 0xa0(%rsp),%rax\n"
+    "add $0x120,%rsp\n"
+    "pop %r13\npop %r12\npop %rsi\n"
+    "ret\n"
+    ".Lrwstub:\n"
+    "ret\n"
+    ".seh_endproc\n"
+    ".section .drectve\n"
+    ".ascii \" -export:fake_replay_write\"\n"
+    ".text\n");
+uint64_t fake_replay_write(void *scratch, uint64_t size, uint64_t capacity, const char *name, void *entry);
+
+
+// Ne_ReplayRecordable_ReadFrom's two apply sites (the bytes of the Steam build at 0x1445cdcc0 and 0x1445ceece): the full state
+// read, which calls the recordable's vtable slot 0x38 with the stream at rsp+0x90, and the delta read, which calls slot 0x28
+// (mode 1) or 0x40 (mode 2) and then the stream's cleanup slot 0xc0. The stored state size is the stream's field at
+// rsp+0xa8. The frame takes the registry entry in rcx, the stored size in edx and the read mode in r8d, and applies the
+// entry's recordable (entry+0x10) through the game's own bytes. Core's replay read guard skips the apply for a recordable the
+// recorder wrote as nothing and a stored size of 0.
+__asm__(
+    ".section .xtls,\"xr\"\n"
+    ".globl fake_replay_read\n"
+    ".def fake_replay_read; .scl 2; .type 32; .endef\n"
+    ".seh_proc fake_replay_read\n"
+    "fake_replay_read:\n"
+    "push %rsi\n.seh_pushreg %rsi\n"
+    "push %rdi\n.seh_pushreg %rdi\n"
+    "push %r12\n.seh_pushreg %r12\n"
+    "push %r13\n.seh_pushreg %r13\n"
+    "sub $0x120,%rsp\n.seh_stackalloc 0x120\n"
+    ".seh_endprologue\n"
+    "mov %edx,0xa8(%rsp)\n"
+    "lea 0x30(%rsp),%r13\n"
+    "movl %r8d,4(%r13)\n"
+    "movl $0,0x10(%r13)\n"
+    "lea fake_stream_obj(%rip),%rsi\n"
+    "mov %rcx,%r12\n"
+    "mov %rcx,%rdi\n"
+    "test %r8d,%r8d\n"
+    "jnz .Lrrdelta\n"
+    "lea 0x90(%rsp),%rdi\n"
+    ".byte 0x48,0x89,0xF9,0x48,0x89,0xF2\n"
+    "call .Lrrnop\n"
+    ".byte 0x49,0x8B,0x4C,0x24,0x10,0x48,0x8B,0x01,0x48,0x89,0xFA,0xFF,0x50,0x38,0xE9\n"
+    ".long .Lrrend - . - 4\n"
+    ".Lrrdelta:\n"
+    ".byte 0x41,0x8B,0x45,0x04,0x83,0xF8,0x02,0x74,0x19,0x83,0xF8,0x01,0x75,0x30,0x48,0x8B,0x4F,0x10,0x48,0x8B,0x01,0x48,0x8D,0x94,0x24,0x90,0x00,0x00,0x00,0xFF,0x50,0x28,0xEB,0x1C,0xC4,0xC1,0x7A,0x10,0x45,0x10,0xC5,0xFA,0x5A,0xD0,0x48,0x8B,0x4F,0x10,0x48,0x8B,0x01,0x48,0x8D,0x94,0x24,0x90,0x00,0x00,0x00,0xFF,0x50,0x40,0x48,0x8B,0x06,0x48,0x89,0xF1,0xFF,0x90,0xC0,0x00,0x00,0x00\n"
+    ".Lrrend:\n"
+    "mov fake_applied(%rip),%rax\n"
+    "add $0x120,%rsp\n"
+    "pop %r13\npop %r12\npop %rdi\npop %rsi\n"
+    "ret\n"
+    ".Lrrnop:\n"
+    "ret\n"
+    ".seh_endproc\n"
+    ".section .drectve\n"
+    ".ascii \" -export:fake_replay_read\"\n"
+    ".text\n");
+uint64_t fake_replay_read(void *entry, uint32_t stored_size, uint32_t mode);
+
+uint64_t fake_applied;
+uintptr_t fake_stream_obj;
+static uintptr_t fake_stream_vt[0x20], fake_rec_vt[0x10];
+static uintptr_t fake_rec_obj[2][1];
+static uint8_t fake_entries[2][0x688];
+
+static void fake_apply(void *self)
+{
+    (void)self;
+    fake_applied++;
+}
+
+static void fake_stream_done(void *self)
+{
+    (void)self;
+}
+
+static uint8_t replay_scratch[0x400];
+
+static void replay_entries_init(void)
+{
+    fake_stream_vt[0xc0 / 8] = (uintptr_t)&fake_stream_done;
+    fake_stream_obj = (uintptr_t)fake_stream_vt;
+    for (int i = 0; i < 0x10; i++)
+        fake_rec_vt[i] = (uintptr_t)&fake_apply;
+    for (int i = 0; i < 2; i++) {
+        fake_rec_obj[i][0] = (uintptr_t)fake_rec_vt;
+        *(uintptr_t *)(fake_entries[i] + 0x10) = (uintptr_t)&fake_rec_obj[i];
+    }
+}
+
+static uint64_t replay_read(int entry, uint32_t size, uint32_t mode)
+{
+    uint64_t before = fake_applied;
+    fake_replay_read(fake_entries[entry], size, mode);
+    return fake_applied - before;
+}
+
+static void test_replay_grid(void)
+{
+    replay_entries_init();
+    expect(fake_replay_write(replay_scratch, 0x100, 0x200, "VehicleSystem", fake_entries[0]) == 0x100,
+           "replay grid: a state within its holder's capacity is recorded whole");
+    expect(fake_replay_write(replay_scratch, 0x200, 0x200, "VehicleSystem", fake_entries[0]) == 0x200,
+           "replay grid: a state exactly the holder's capacity is recorded whole");
+    expect(replay_read(0, 12, 1) == 1 && replay_read(0, 12, 2) == 1 && replay_read(0, 12, 0) == 1,
+           "replay grid: a recorded state is applied by the delta reads and the full read");
+    expect(replay_read(1, 0, 1) == 1 && replay_read(1, 0, 2) == 1 && replay_read(1, 0, 0) == 1,
+           "replay grid: an empty stored state of a recordable the recorder never cut is applied as the game does");
+    expect(fake_replay_write(replay_scratch, 0x300, 0x200, "CannedEventsSystem", fake_entries[0]) == 0,
+           "replay grid: a state larger than its holder's capacity is recorded as nothing");
+    expect(fake_replay_write(replay_scratch, 0x300, 0x300, "TyreSystem", fake_entries[1]) == 0x300,
+           "replay grid: the next recordable with a fitting state is recorded whole");
+    expect(replay_read(0, 0, 1) == 0 && replay_read(0, 0, 2) == 0,
+           "replay grid: reading the empty state of a cut recordable skips its delta apply");
+    expect(replay_read(0, 0, 0) == 0, "replay grid: reading the empty state of a cut recordable skips its full apply");
+    expect(replay_read(0, 12, 1) == 1 && replay_read(0, 12, 0) == 1,
+           "replay grid: a stored state with bytes is applied even for a cut recordable");
+    expect(replay_read(1, 0, 1) == 1 && replay_read(1, 0, 0) == 1,
+           "replay grid: another recordable's empty state is still applied");
+}
+
+static void run_replay_grid(void)
+{
+    SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    replay_entries_init();
+    uint64_t r = fake_replay_write(replay_scratch, 0x3000, 0x1c00, "VehicleSystem", fake_entries[0]);
+    printf("      replay grid: the recorder would copy 0x%llx bytes\n", (unsigned long long)r);
     fflush(stdout);
 }
 
@@ -2308,8 +2847,13 @@ int main(int argc, char **argv)
         test_ers_mode();
         test_standings();
         test_weekends();
+        test_teamhq();
+        test_activity();
+        test_teammate_pairs();
+        test_setup_vm();
         test_fe_tiles();
         test_ai_corner();
+        test_replay_grid();
         test_garage_crew(1);
         test_pit_crew(1);
         test_garage_scene(1);
@@ -2353,12 +2897,22 @@ int main(int argc, char **argv)
         crash_standings();
     if (argc > 1 && !strcmp(argv[1], "weekends"))
         crash_weekends();
+    if (argc > 1 && !strcmp(argv[1], "teamhq"))
+        crash_teamhq();
+    if (argc > 1 && !strcmp(argv[1], "activity"))
+        crash_activity();
+    if (argc > 1 && !strcmp(argv[1], "pairs"))
+        crash_pairs();
+    if (argc > 1 && !strcmp(argv[1], "setup_vm"))
+        crash_setup_vm();
     if (argc > 1 && !strcmp(argv[1], "fe_scan"))
         crash_fe_scan();
     if (argc > 1 && !strcmp(argv[1], "fe_row"))
         crash_fe_row();
     if (argc > 1 && !strcmp(argv[1], "ai_corner"))
         crash_ai_corner();
+    if (argc > 1 && !strcmp(argv[1], "replay_grid"))
+        run_replay_grid();
     if (argc > 1 && !strcmp(argv[1], "garage_crew")) {
         const char *off = getenv("SWOFTY_GARAGE_CREW_GUARD");
         test_garage_crew(!(off && *off));

@@ -12,6 +12,7 @@
 pub mod career_names;
 pub mod careers;
 pub mod cloud;
+pub mod guard;
 pub mod locate;
 pub mod migrate;
 pub mod restore;
@@ -680,6 +681,7 @@ impl Vault {
             {
                 Some(mut s) => {
                     s.id = id;
+                    s.source.clone_from(&self.source);
                     out.push(s);
                 }
                 None => unreadable.push(name),
